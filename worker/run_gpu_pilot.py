@@ -429,8 +429,25 @@ def main() -> None:
     mask_emb = emb_w[model.cfg.mask_token_id].unsqueeze(0)
     decay_w = torch.tensor([math.exp(-0.15 * k) for k in range(model.cfg.block_size - 1)], dtype=torch.float32, device=device)
 
+    # Patch gp.make_optimizer to drop empty parameter groups (required for Stage-1 bridge-only training)
+    def _safe_make_optimizer(m, lr=2e-4, bridge_lr_mult=5.0):
+        bb, br = [], []
+        for n, p in m.named_parameters():
+            if not p.requires_grad:
+                continue
+            (br if "selected_prefix_bridge" in n else bb).append(p)
+        groups = []
+        if bb:
+            groups.append({"params": bb, "weight_decay": 0.0, "lr": lr, "lr_mult": 1.0})
+        if br:
+            groups.append({"params": br, "weight_decay": 0.0, "lr": lr * bridge_lr_mult, "lr_mult": bridge_lr_mult})
+        return torch.optim.AdamW(groups, lr=lr, betas=(0.9, 0.95), fused=True)
+
+    gp.make_optimizer = _safe_make_optimizer
+
     # Private held-out eval baseline for theta_0 & Owner 10-step FLTrust root direction
-    val280 = gp.load_eval_profile("/work/eval/bit280")
+    val280 = gp.load_eval_profile("bit280")
+    assert len(val280) > 0, "val280 eval shards empty"
     base_val = gp.eval_shards_tapmode(model, val280, emb_w, head_w, device)
     log(f"Base theta_0 private val280: B16={base_val['b16_ref_tau']:.4f} B8={base_val['b8_ref_tau']:.4f} ce8={base_val['ce8']:.4f}")
 
