@@ -553,3 +553,83 @@ def verify_drafter_train_phase_a(
         f"Phase A safe-parse passed ({n_tensors} tensors, L2={l2_norm:.3f}, 0 NaNs); queued for Owner GPU Held-Out Replay + FLTrust Cosine Gate",
         metrics,
     )
+
+
+def verify_drafter_pack(
+    artifact_path: Path,
+    slot_plan: dict[str, Any],
+    peer_verified_metrics: list[dict[str, Any]],
+) -> VerifyResult:
+    """Verify a deterministic CPU g6load dspine rank-pack manifest JSON upload (zero GPU, bit-exact SHA-256)."""
+    try:
+        data = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return VerifyResult(False, "rejected", "failed_json", f"pack manifest JSON parse error: {e}")
+
+    for k in ("checkpoint_rev", "ckpt_sha256", "nr", "format_version", "ranks"):
+        if k not in data:
+            return VerifyResult(False, "rejected", "failed_schema", f"pack manifest missing key '{k}'")
+
+    nr = int(data["nr"])
+    if slot_plan.get("nr") and nr != int(slot_plan["nr"]):
+        return VerifyResult(False, "rejected", "failed_nr", f"nr={nr} != expected {slot_plan['nr']}")
+    if nr not in (1, 2, 4, 8):
+        return VerifyResult(False, "rejected", "failed_nr", f"unsupported tp nr={nr}")
+
+    if str(data["format_version"]) != "g6dspine-v1":
+        return VerifyResult(False, "rejected", "failed_format", f"unexpected format_version={data['format_version']}")
+
+    ckpt_sha = str(data["ckpt_sha256"]).lower()
+    if not HEX64_RE.match(ckpt_sha):
+        return VerifyResult(False, "rejected", "failed_ckpt_sha", "ckpt_sha256 must be 64-char hex")
+    if slot_plan.get("ckpt_sha256") and ckpt_sha != str(slot_plan["ckpt_sha256"]).lower():
+        return VerifyResult(False, "rejected", "failed_ckpt_sha", "ckpt_sha256 does not match planned checkpoint")
+
+    ranks = data["ranks"]
+    if not isinstance(ranks, list) or len(ranks) != nr:
+        return VerifyResult(False, "rejected", "failed_ranks", f"expected {nr} rank entries, got {type(ranks).__name__}")
+
+    rank_shas: list[str] = []
+    total_pack_bytes = 0
+    for idx, rk in enumerate(ranks):
+        if not isinstance(rk, dict) or int(rk.get("rank", -1)) != idx:
+            return VerifyResult(False, "rejected", "failed_rank_index", f"rank entry {idx} malformed")
+        rsha = str(rk.get("pack_sha256", "")).lower()
+        rbytes = int(rk.get("pack_bytes", 0))
+        if not HEX64_RE.match(rsha) or rbytes <= 0:
+            return VerifyResult(False, "rejected", "failed_rank_sha", f"rank {idx} invalid sha256/bytes")
+        rank_shas.append(rsha)
+        total_pack_bytes += rbytes
+
+    quorum_note = "verified_bitexact_pack"
+    for peer in peer_verified_metrics:
+        p_shas = peer.get("rank_pack_sha256s") or []
+        if p_shas and p_shas != rank_shas:
+            return VerifyResult(
+                False,
+                "rejected",
+                "failed_pack_quorum",
+                "bit-exact rank pack SHA-256 mismatch against peer",
+                {"peer_rank_shas": p_shas, "submitted_rank_shas": rank_shas},
+            )
+        if p_shas:
+            quorum_note = "bitexact_pack_quorum_matched"
+
+    metrics = {
+        "checkpoint_rev": str(data["checkpoint_rev"]),
+        "ckpt_sha256": ckpt_sha,
+        "nr": nr,
+        "format_version": str(data["format_version"]),
+        "rank_pack_sha256s": rank_shas,
+        "total_pack_bytes": total_pack_bytes,
+        "elapsed_s": data.get("elapsed_s"),
+        "g6load_sha256": data.get("g6load_sha256"),
+        "quorum": quorum_note,
+    }
+    return VerifyResult(
+        True,
+        "verified",
+        quorum_note,
+        f"verified deterministic CPU g6load dspine TP{nr} pack ({nr} ranks, {total_pack_bytes/1e9:.2f} GB, sha0={rank_shas[0][:12]}...)",
+        metrics,
+    )

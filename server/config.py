@@ -23,6 +23,7 @@ MAX_CHUNK_BYTES = 8 * 1024 * 1024           # 8 MiB per chunk (under both Hostin
 MAX_DECOMPRESSED_LABEL_BYTES = 64 * 1024 * 1024  # zip-bomb guard for gzipped JSONL
 MAX_UPLOAD_BYTES_BY_KIND = {
     "drafter-eval": 2 * 1024 * 1024,          # 2 MiB (<50 KB expected)
+    "drafter-pack": 2 * 1024 * 1024,          # 2 MiB (<50 KB deterministic TP rank SHA-256 manifest)
     "drafter-label": 32 * 1024 * 1024,        # 32 MiB (~1.2 MB gz expected)
     "drafter-capture": 256 * 1024 * 1024,     # 256 MiB for pilot 4-tap INT8 shard pack
     "drafter-train": 2_800 * 1024 * 1024,     # 2.8 GB (59 MB S1 / 548 MB SparseLoCo / 2.44 GB INT8 dense)

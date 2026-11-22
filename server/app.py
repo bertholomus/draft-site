@@ -669,6 +669,15 @@ def _finalize_upload(
         vres = verify.verify_drafter_capture(staged_file, slot_plan, manifest)
     elif kind == "drafter-train":
         vres = verify.verify_drafter_train_phase_a(staged_file, slot_plan, manifest)
+    elif kind == "drafter-pack":
+        peers = conn.execute(
+            """SELECT metrics_json FROM slots
+               WHERE job=? AND state='verified' AND slot_id != ?
+                 AND row_key=? AND col_key=?""",
+            (slot["job"], slot["slot_id"], slot["row_key"], slot["col_key"]),
+        ).fetchall()
+        peer_metrics = [json.loads(p["metrics_json"] or "{}") for p in peers]
+        vres = verify.verify_drafter_pack(staged_file, slot_plan, peer_metrics)
     else:
         staged_file.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=f"unsupported job_kind '{kind}'")
@@ -1085,7 +1094,7 @@ async def admin_upsert_job(request: Request) -> dict[str, Any]:
     job = _validate_id(str(body.get("job") or ""), "job")
     title = str(body.get("title") or job)
     job_kind = str(body.get("job_kind") or "")
-    if job_kind not in ("drafter-label", "drafter-train", "drafter-eval", "drafter-capture"):
+    if job_kind not in ("drafter-label", "drafter-train", "drafter-eval", "drafter-capture", "drafter-pack"):
         raise HTTPException(status_code=400, detail="invalid job_kind")
     model = str(body.get("model") or "GLM-5.3")
     release_repo = str(body.get("release_repo") or "kindlingai/glm-5.3-exlr8-k2-k3-k4")

@@ -403,10 +403,16 @@ async function selectJob(jobId) {
   document.getElementById('gridTitle').textContent = `${data.title} (${data.job})`;
   document.getElementById('gridMeta').textContent = `${data.job_kind} · ${data.release}@${data.revision.slice(0,8)} · ${data.slots.length} slots`;
   const sg = document.getElementById('slotGrid');
-  sg.innerHTML = data.slots.map(s => {
+  const activeSlots = data.slots.filter(s => s.state !== 'open');
+  const openSlots = data.slots.filter(s => s.state === 'open');
+  const maxOpenShow = 48;
+  const shown = data.slots.length > 80 ? activeSlots.concat(openSlots.slice(0, maxOpenShow)) : data.slots;
+  const hiddenOpen = Math.max(0, (data.slots.length > 80 ? openSlots.length - maxOpenShow : 0));
+  sg.innerHTML = shown.map(s => {
     const m = s.metrics || {};
     let mline = '';
     if (m.b16_ref_tau != null) mline = `B16=${m.b16_ref_tau} B8=${m.b8_ref_tau} ce8=${m.ce8}`;
+    else if (m.rank_pack_sha256s && m.rank_pack_sha256s.length) mline = `TP${m.nr} · ${m.elapsed_s || '?'}s · ${m.rank_pack_sha256s[0].slice(0,10)}…`;
     else if (m.owner_gate && m.owner_gate.delta_ce8 != null) mline = `Δce8=${m.owner_gate.delta_ce8} cos=${m.owner_gate.cos_vs_root}`;
     else if (m.server_delta_l2_norm != null) mline = `L2=${m.server_delta_l2_norm} (${fmtBytes(s.upload_bytes)})`;
     else if (m.n_rows != null) mline = `${m.n_rows} rows · ${m.total_gen_tokens || m.n_tokens || 0} tok`;
@@ -417,12 +423,12 @@ async function selectJob(jobId) {
       <div class="st">${esc(s.state)} · ${esc(s.profile || s.col)}</div>
       <div class="meta2">${by}${by && mline ? '<br>' : ''}${esc(mline)}${s.verify_status ? '<br>gate: ' + esc(s.verify_status) : ''}</div>
     </div>`;
-  }).join('');
+  }).join('') + (hiddenOpen > 0 ? `<div class="slot-cell st-open"><div class="sid">+${hiddenOpen} open slots</div><div class="st">queued</div><div class="meta2">ready for parallel fleet workers</div></div>` : '');
 }
 
 async function renderMatrixAndRounds() {
   const evalJob = JOBS.find(j => j.job_kind === 'drafter-eval');
-  const trainJob = JOBS.find(j => j.job_kind === 'drafter-train');
+  const trainJobs = JOBS.filter(j => j.job_kind === 'drafter-train');
   if (evalJob) {
     const g = await apiGet('/api/grid?job=' + encodeURIComponent(evalJob.job));
     const profs = ['bit200','bit240','bit280','bit322','bit400'];
@@ -449,19 +455,22 @@ async function renderMatrixAndRounds() {
       document.getElementById('evalMatrixBody').innerHTML = html;
     }
   }
-  if (trainJob) {
-    const g = await apiGet('/api/grid?job=' + encodeURIComponent(trainJob.job));
-    const rds = g.rounds || [];
-    if (!rds.length) {
+  if (trainJobs.length) {
+    const allRds = [];
+    for (const tj of trainJobs) {
+      const g = await apiGet('/api/grid?job=' + encodeURIComponent(tj.job));
+      for (const r of (g.rounds || [])) allRds.push({job: tj.job, ...r});
+    }
+    if (!allRds.length) {
       document.getElementById('roundsBody').innerHTML = '<div class="meta">No training rounds registered.</div>';
     } else {
-      let html = '<table><thead><tr><th>Round</th><th>Base Ckpt</th><th>Status</th><th>Agg Method</th><th class="num">MP 5-Prof B16</th><th class="num">14-Dump B16 / roll16</th><th>Champion Reference</th></tr></thead><tbody>';
-      for (const r of rds) {
+      let html = '<table><thead><tr><th>Job / Round</th><th>Base Ckpt</th><th>Status</th><th>Agg Method</th><th class="num">MP 5-Prof B16</th><th class="num">14-Dump B16 / roll16</th><th>Champion Reference</th></tr></thead><tbody>';
+      for (const r of allRds) {
         const m = r.agg_metrics || {};
         const mp = m.mp_mean_b16 != null ? Number(m.mp_mean_b16).toFixed(4) : '—';
         const d14 = (m.sim14_b16 != null) ? `${Number(m.sim14_b16).toFixed(4)} / ${Number(m.sim14_roll16 || 0).toFixed(4)}` : '—';
-        const champ = m.champion_ref ? `MP ${m.champion_ref.mp_mean_b16} · 14d ${m.champion_ref.sim14_b16}` : 'v5-s2-w5@500 (MP 5.899 · 14d 5.750)';
-        html += `<tr><td>R${r.round}</td><td><code>${esc(r.base_ckpt_name)}</code></td><td>${esc(r.status)}</td><td>${esc(r.agg_method || '—')}</td><td class="num"><strong>${mp}</strong></td><td class="num">${d14}</td><td style="color:var(--muted)">${esc(champ)}</td></tr>`;
+        const champ = m.champion_ref ? `MP ${m.champion_ref.mp_mean_b16} · 14d ${m.champion_ref.sim14_b16}` : 'v5-s2-w5@500 (MP 5.899 · 14d 5.788)';
+        html += `<tr><td><code>${esc(r.job)}</code> R${r.round}</td><td><code>${esc(r.base_ckpt_name)}</code></td><td>${esc(r.status)}</td><td>${esc(r.agg_method || '—')}</td><td class="num"><strong>${mp}</strong></td><td class="num">${d14}</td><td style="color:var(--muted)">${esc(champ)}</td></tr>`;
       }
       html += '</tbody></table>';
       document.getElementById('roundsBody').innerHTML = html;
