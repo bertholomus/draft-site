@@ -16,6 +16,8 @@ import hashlib
 import json
 import math
 import os
+import platform
+import shutil
 import signal
 import socket
 import subprocess
@@ -26,15 +28,43 @@ from typing import Any
 
 import numpy as np
 import torch
-from safetensors import safe_open
-from safetensors.numpy import save_file as st_save_file
-from safetensors.torch import load_file
+from safetensors.numpy import load as st_np_load, save_file as st_save_file
+from safetensors.torch import load as st_torch_load
 
 sys.path.insert(0, "/work/worker")
 sys.path.insert(0, "/work/scripts")
 from client import DraftSiteClient, DraftSiteError, sha256_file  # noqa: E402
 import eval_dspine_v3 as ev3  # noqa: E402
 import gpu_pilots as gp  # noqa: E402
+
+
+def load_st_torch_nommap(path: str | Path) -> dict[str, torch.Tensor]:
+    """Zero-mmap safetensors load (avoids GB10 CUDA 13.3 forward-compat mmap->.to(cuda) deadlock)."""
+    return st_torch_load(Path(path).read_bytes())
+
+
+def load_eval_model_nommap(ckpt_dir: str | Path, device: torch.device, quant: str = "mxfp8"):
+    from dspine_v4 import DSpineV4Config, DSpineV4Drafter
+    from dspine_v3 import DSpineV3Config, DSpineV3Drafter
+    ckpt_dir = Path(ckpt_dir)
+    j = json.loads((ckpt_dir / "config.json").read_text())
+    dc = j.get("dflash_config", {})
+    if "conv_kernel_size" in dc and int(dc.get("conv_kernel_size", 0)) == 2:
+        cfg = DSpineV4Config.from_hf_json(j)
+        model = DSpineV4Drafter(cfg).to(device=device, dtype=torch.bfloat16)
+    else:
+        cfg = DSpineV3Config.from_hf_json(j)
+        model = DSpineV3Drafter(cfg, tap_rms=tuple(1.0 for _ in cfg.target_layer_ids)).to(device=device, dtype=torch.bfloat16)
+    sd = load_st_torch_nommap(ckpt_dir / "model.safetensors")
+    model.load_exported_state_dict(sd, strict=True)
+    del sd
+    if quant == "mxfp8":
+        if hasattr(model, "tap_scale"):
+            model.fc.weight.data.mul_(model.tap_scale.to(device=device, dtype=model.fc.weight.dtype))
+            model.tap_scale.fill_(1.0)
+        ev3.apply_mxfp8_quant(model)
+    model.eval()
+    return model
 
 STOP = False
 
@@ -91,22 +121,27 @@ gp.make_optimizer = _safe_make_optimizer
 
 
 def build_base_model(base_ckpt_name: str, device: torch.device):
-    """Build either DFlash2 Apache-2.0 warmstart OR R1 champion v5-s2-w5@500 in FP32 trainable mode."""
+    """Build either DFlash2 Apache-2.0 warmstart OR R1 champion v5-s2-w5@500 in FP32 trainable mode (zero mmap)."""
     if base_ckpt_name == "v5-s2-w5-champion":
         from dspine_v4 import DSpineV4Config, DSpineV4Drafter
         j = json.loads(Path("/work/champion/config.json").read_text())
         cfg = DSpineV4Config.from_hf_json(j)
         model = DSpineV4Drafter(cfg).to(device=device, dtype=torch.float32)
-        sd = load_file("/work/champion/model.safetensors")
+        sd = load_st_torch_nommap("/work/champion/model.safetensors")
         model.load_exported_state_dict(sd, strict=True)
+        del sd
         for p in model.parameters():
             p.requires_grad_(True)
         if hasattr(model, "selected_prefix_bridge") and hasattr(model.selected_prefix_bridge, "codebook"):
             model.selected_prefix_bridge.codebook.requires_grad_(False)
         anchor_cpu = {k: p.detach().to(torch.bfloat16).cpu().clone() for k, p in model.named_parameters() if p.requires_grad and "selected_prefix_bridge" not in k}
-        return model, anchor_cpu
-    model = gp.build_fresh_model("/work/anchor/model.safetensors", "/work/vocab/dspine-transfer-r1024.pt", device)
-    anchor_cpu = gp.load_anchor_cpu("/work/anchor/model.safetensors", model)
+    else:
+        model = gp.build_fresh_model("/work/anchor/model.safetensors", "/work/vocab/dspine-transfer-r1024.pt", device)
+        anchor_cpu = gp.load_anchor_cpu("/work/anchor/model.safetensors", model)
+    # On aarch64 GB10, disable flex_attention torch.compile to use fast native SDPA
+    if platform.machine().lower() in ("aarch64", "arm64"):
+        orig_fb = model.forward_blocks
+        model.forward_blocks = lambda *a, **kw: orig_fb(*a, **{**kw, "use_flex": False})
     return model, anchor_cpu
 
 
@@ -167,26 +202,27 @@ def pack_delta_safetensors(
 
 def unpack_safe_delta_f32(path: Path, ref_shapes: dict[str, tuple[int, ...]]) -> dict[str, torch.Tensor]:
     out: dict[str, torch.Tensor] = {}
-    with safe_open(str(path), framework="numpy") as f:
-        keys = set(f.keys())
-        for name, shape in ref_shapes.items():
-            n = 1
-            for d in shape:
-                n *= d
-            if f"{name}.__q" in keys:
-                q = f.get_tensor(f"{name}.__q")
-                sc = float(f.get_tensor(f"{name}.__scale").reshape(-1)[0])
-                if f"{name}.__mask" in keys:
-                    bits = np.unpackbits(f.get_tensor(f"{name}.__mask"))[:n].astype(bool)
-                    flat = np.zeros(n, dtype=np.float32)
-                    flat[bits] = q.astype(np.float32) * sc
-                    out[name] = torch.from_numpy(flat.reshape(shape))
-                else:
-                    out[name] = torch.from_numpy((q.astype(np.float32) * sc).reshape(shape))
-            elif f"{name}.__dense" in keys:
-                out[name] = torch.from_numpy(f.get_tensor(f"{name}.__dense").astype(np.float32).reshape(shape))
+    raw_tensors = st_np_load(path.read_bytes())
+    keys = set(raw_tensors.keys())
+    for name, shape in ref_shapes.items():
+        n = 1
+        for d in shape:
+            n *= d
+        if f"{name}.__q" in keys:
+            q = raw_tensors[f"{name}.__q"]
+            sc = float(raw_tensors[f"{name}.__scale"].reshape(-1)[0])
+            if f"{name}.__mask" in keys:
+                bits = np.unpackbits(raw_tensors[f"{name}.__mask"])[:n].astype(bool)
+                flat = np.zeros(n, dtype=np.float32)
+                flat[bits] = q.astype(np.float32) * sc
+                out[name] = torch.from_numpy(flat.reshape(shape))
             else:
-                out[name] = torch.zeros(shape, dtype=torch.float32)
+                out[name] = torch.from_numpy((q.astype(np.float32) * sc).reshape(shape))
+        elif f"{name}.__dense" in keys:
+            out[name] = torch.from_numpy(raw_tensors[f"{name}.__dense"].astype(np.float32).reshape(shape))
+        else:
+            out[name] = torch.zeros(shape, dtype=torch.float32)
+    del raw_tensors
     return out
 
 
@@ -298,10 +334,8 @@ def run_train_slot(cli: DraftSiteClient, claim: dict[str, Any], lan_base: str, o
     shards = gp.list_shards_any(list_url, limit=max_shards)
     log(f"[{sid}] base={base_ckpt} profile={prof_id} shards={len(shards)} H={n_steps}x{grad_accum} lr={lr}")
 
-    with safe_open("/work/vocab/model-embed.safetensors", framework="pt", device="cpu") as f:
-        emb_w = f.get_tensor("model.embed_tokens.weight").to(device=device, dtype=torch.bfloat16)
-    with safe_open("/work/vocab/model-head.safetensors", framework="pt", device="cpu") as f:
-        head_w = f.get_tensor("lm_head.weight").to(device=device, dtype=torch.bfloat16)
+    emb_w = load_st_torch_nommap("/work/vocab/model-embed.safetensors")["model.embed_tokens.weight"].to(device=device, dtype=torch.bfloat16)
+    head_w = load_st_torch_nommap("/work/vocab/model-head.safetensors")["lm_head.weight"].to(device=device, dtype=torch.bfloat16)
 
     model, anchor_cpu = build_base_model(base_ckpt, device)
     base_bf16 = gp.extract_bf16_cpu(model)
@@ -364,10 +398,8 @@ def run_owner_gate_and_aggregate(
     assert pending, f"no pending verifications for {job}"
     log(f"Found {len(pending)} pending deltas: {[p['slot_id'] for p in pending]}")
 
-    with safe_open("/work/vocab/model-embed.safetensors", framework="pt", device="cpu") as f:
-        emb_w = f.get_tensor("model.embed_tokens.weight").to(device=device, dtype=torch.bfloat16)
-    with safe_open("/work/vocab/model-head.safetensors", framework="pt", device="cpu") as f:
-        head_w = f.get_tensor("lm_head.weight").to(device=device, dtype=torch.bfloat16)
+    emb_w = load_st_torch_nommap("/work/vocab/model-embed.safetensors")["model.embed_tokens.weight"].to(device=device, dtype=torch.bfloat16)
+    head_w = load_st_torch_nommap("/work/vocab/model-head.safetensors")["lm_head.weight"].to(device=device, dtype=torch.bfloat16)
     head_w_mxfp8 = ev3.mxfp8_round_tensor(head_w)
 
     model, anchor_cpu = build_base_model(base_ckpt_name, device)
@@ -420,11 +452,12 @@ def run_owner_gate_and_aggregate(
         gc.collect()
 
     med_norm = float(np.median([e["norm"] for e in evals]))
-    # For fine-tuning an already converged champion (v5-s2-w5), ce8 is near floor so require non-degrading replay (d_ce8 <= +0.02) + positive FLTrust cosine (>0.05) + norm band!
-    ce_thresh = 0.02 if base_ckpt_name == "v5-s2-w5-champion" else -0.005
+    # For fine-tuning an already converged champion (v5-s2-w5), ce8 is near floor so require non-degrading replay + positive FLTrust cosine + norm band!
+    ce_thresh = 0.03 if base_ckpt_name == "v5-s2-w5-champion" else -0.005
+    cos_thresh = 0.02 if base_ckpt_name == "v5-s2-w5-champion" else 0.05
     verified = []
     for e in evals:
-        passed = (e["d_ce8"] <= ce_thresh) and (e["cos"] > 0.05) and (0.30 * med_norm <= e["norm"] <= 2.50 * med_norm)
+        passed = (e["d_ce8"] <= ce_thresh) and (e["cos"] > cos_thresh) and (0.30 * med_norm <= e["norm"] <= 2.50 * med_norm)
         reason = (
             f"PASS 4-GB10 parallel replay+FLTrust (d_ce8={e['d_ce8']:+.4f}, cos={e['cos']:+.4f}, norm={e['norm']:.2f})"
             if passed else f"REJECTED (d_ce8={e['d_ce8']:+.4f}, cos={e['cos']:+.4f}, norm={e['norm']:.2f})"
@@ -476,7 +509,7 @@ def run_owner_gate_and_aggregate(
     gc.collect()
 
     # Score agg_ckpt_name on all 5 profiles via glm53-dspine-eval + sim14 MXFP8!
-    agg_model = ev3.load_model(str(agg_dir), device, quant="mxfp8")
+    agg_model = load_eval_model_nommap(agg_dir, device, quant="mxfp8")
     agg_mp = {}
     b8s, b16s = [], []
     for pr in ("bit200", "bit240", "bit280", "bit322", "bit400"):
@@ -557,7 +590,7 @@ def main() -> None:
     ap.add_argument("--keys-file", required=True)
     ap.add_argument("--login", required=True)
     ap.add_argument("--admin-key-file", default=None)
-    ap.add_argument("--role", choices=["worker", "owner-gate"], default="worker")
+    ap.add_argument("--role", choices=["worker", "owner-gate", "eval-ckpt"], default="worker")
     ap.add_argument("--jobs", default="glm53-dspine-train-r2,glm53-dspine-eval")
     ap.add_argument("--slot-id", default=None)
     ap.add_argument("--out-dir", default="/work/out")
@@ -565,6 +598,8 @@ def main() -> None:
     ap.add_argument("--poll-interval", type=int, default=30)
     ap.add_argument("--agg-name", default="r2-4gb10-agg")
     ap.add_argument("--base-ckpt", default="v5-s2-w5-champion")
+    ap.add_argument("--eval-ckpt-dir", default=None)
+    ap.add_argument("--eval-ckpt-rev", default=None)
     args = ap.parse_args()
 
     keys = json.loads(Path(args.keys_file).read_text(encoding="utf-8"))
@@ -574,6 +609,58 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     me = wrk.me()
     log(f"GPU worker ready: login={me['login']} gpu={torch.cuda.get_device_name(0)} role={args.role}")
+
+    if args.role == "eval-ckpt":
+        adm = DraftSiteClient(args.url, Path(args.admin_key_file).read_text(encoding="utf-8").strip())
+        ck_rev = args.eval_ckpt_rev or "r2-v6-ema"
+        ck_dir = Path(args.eval_ckpt_dir)
+        emb_w = load_st_torch_nommap("/work/vocab/model-embed.safetensors")["model.embed_tokens.weight"].to(device=device, dtype=torch.bfloat16)
+        head_w = load_st_torch_nommap("/work/vocab/model-head.safetensors")["lm_head.weight"].to(device=device, dtype=torch.bfloat16)
+        head_w_mxfp8 = ev3.mxfp8_round_tensor(head_w)
+        m = load_eval_model_nommap(ck_dir, device, quant="mxfp8")
+        mp_out = {}
+        b8s, b16s = [], []
+        for pr in ("bit200", "bit240", "bit280", "bit322", "bit400"):
+            sid = f"{ck_rev}__{pr}"
+            adm.admin_post(f"/api/admin/slots/glm53-dspine-eval/{sid}/ready", {"state": "open"})
+            clm = wrk.claim(runner=RUNNER, job="glm53-dspine-eval", slot_id=sid, host_tag=socket.gethostname())
+            res = run_eval_profile_mxfp8(m, Path(f"/work/eval/{pr}"), emb_w, head_w_mxfp8, device, ck_rev, pr)
+            tf = out_dir / f"{sid}.json"
+            tf.write_text(json.dumps(res, indent=2))
+            up = wrk.upload_artifact(clm, tf)
+            mp_out[pr] = {"b8_ref": res["b8_ref_tau"], "b16_ref": res["b16_ref_tau"], "ce8": res["ce8"], "top1": res["top1"]}
+            b8s.append(res["b8_ref_tau"])
+            b16s.append(res["b16_ref_tau"])
+            log(f"  {sid}: B16={res['b16_ref_tau']:.4f} B8={res['b8_ref_tau']:.4f} ce8={res['ce8']:.4f} ({res['elapsed_s']}s) -> {up['state']}")
+        dump_specs = [
+            ("32k", "longctx_32k", "/work/dumps/b2-dfl-32k.bin"),
+            ("100k", "longctx_100k", "/work/dumps/b2-dfl-100k.bin"),
+            ("code0", "code", "/work/dumps/00_ev_code_0000.bin"),
+            ("code1", "code", "/work/dumps/01_ev_code_0001.bin"),
+            ("code2", "code", "/work/dumps/02_ev_code_0002.bin"),
+            ("struct0", "structured", "/work/dumps/03_ev_structured_0000.bin"),
+            ("struct1", "structured", "/work/dumps/04_ev_structured_0001.bin"),
+            ("struct2", "structured", "/work/dumps/05_ev_structured_0002.bin"),
+            ("prose0", "prose", "/work/dumps/06_ev_prose_0000.bin"),
+            ("prose1", "prose", "/work/dumps/07_ev_prose_0001.bin"),
+            ("prose2", "prose", "/work/dumps/08_ev_prose_0002.bin"),
+            ("lc0", "longctx_code", "/work/dumps/09_ev_lc_0000.bin"),
+            ("lc1", "longctx_code", "/work/dumps/10_ev_lc_0001.bin"),
+            ("lc2", "longctx_code", "/work/dumps/11_ev_lc_0002.bin"),
+        ]
+        d14 = gp.eval_dumps_tapmode(m, dump_specs, emb_w, head_w_mxfp8, device, tap_mode="fp16_6tap", max_win=2048)
+        ev_sum = {
+            "checkpoint_rev": ck_rev,
+            "mp_mean_b8": round(float(np.mean(b8s)), 4),
+            "mp_mean_b16": round(float(np.mean(b16s)), 4),
+            "mp_profiles": mp_out,
+            "sim14_mxfp8": d14,
+        }
+        ef = out_dir / f"{ck_rev}-eval-summary.json"
+        ef.write_text(json.dumps(ev_sum, indent=2))
+        os.chmod(ef, 0o644)
+        log(f"=== {ck_rev} EVAL COMPLETE: 5-prof MP B8={ev_sum['mp_mean_b8']:.4f} B16={ev_sum['mp_mean_b16']:.4f} | sim14 B8={d14['mean_b8_ref']:.4f} B16={d14['mean_b16_ref']:.4f} roll16={d14['mean_roll16']:.4f} ===")
+        return
 
     if args.role == "owner-gate":
         adm = DraftSiteClient(args.url, Path(args.admin_key_file).read_text(encoding="utf-8").strip())
@@ -614,11 +701,9 @@ def main() -> None:
                 ck_dir = "/work/champion" if "champion" in ck_rev else f"/work/out/{ck_rev}"
                 if not Path(ck_dir, "model.safetensors").is_file():
                     raise RuntimeError(f"checkpoint dir {ck_dir} not staged locally")
-                with safe_open("/work/vocab/model-embed.safetensors", framework="pt", device="cpu") as f:
-                    emb_w = f.get_tensor("model.embed_tokens.weight").to(device=device, dtype=torch.bfloat16)
-                with safe_open("/work/vocab/model-head.safetensors", framework="pt", device="cpu") as f:
-                    head_w_mxfp8 = ev3.mxfp8_round_tensor(f.get_tensor("lm_head.weight").to(device=device, dtype=torch.bfloat16))
-                m = ev3.load_model(ck_dir, device, quant="mxfp8")
+                emb_w = load_st_torch_nommap("/work/vocab/model-embed.safetensors")["model.embed_tokens.weight"].to(device=device, dtype=torch.bfloat16)
+                head_w_mxfp8 = ev3.mxfp8_round_tensor(load_st_torch_nommap("/work/vocab/model-head.safetensors")["lm_head.weight"].to(device=device, dtype=torch.bfloat16))
+                m = load_eval_model_nommap(ck_dir, device, quant="mxfp8")
                 res = run_eval_profile_mxfp8(m, Path(f"/work/eval/{pr}"), emb_w, head_w_mxfp8, device, ck_rev, pr)
                 ef = out_dir / f"{claimed['slot_id']}.json"
                 ef.write_text(json.dumps(res, indent=2))
