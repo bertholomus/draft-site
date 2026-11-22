@@ -221,24 +221,25 @@ def init_db() -> None:
                    ON CONFLICT(login) DO UPDATE SET key_hash=excluded.key_hash, is_admin=1, approved=1""",
                 (kh, now),
             )
-        # Bootstrap closed-pilot internal machine keys
+        # Bootstrap closed-pilot internal machine keys (neutral public logins; private host map stays admin-only)
         tier_defaults = {
-            "bertholomus-mastersim": ["tier-train", "tier-eval", "tier-capture"],
-            "bertholomus-frankennas": ["tier-label", "tier-eval", "tier-cpu"],
-            "bertholomus-mac": ["tier-label", "tier-eval", "tier-cpu"],
-            "bertholomus-ascent": ["tier-train", "tier-eval", "tier-label"],
-            "bertholomus-redteam": ["tier-train", "tier-eval", "tier-label", "tier-capture"],
+            "bertholomus-w1": (["tier-label", "tier-eval", "tier-cpu"], "private-host: host-1 (NAS CPU worker)"),
+            "bertholomus-w2": (["tier-label", "tier-eval", "tier-cpu"], "private-host: host-2 (macOS workstation)"),
+            "bertholomus-w3": (["tier-train", "tier-eval", "tier-capture"], "private-host: host-3 (96GB Blackwell GPU)"),
+            "bertholomus-w4": (["tier-train", "tier-eval", "tier-label"], "private-host: host-4 (128GB GB10 GPU)"),
+            "bertholomus-qa": (["tier-train", "tier-eval", "tier-label", "tier-capture"], "private-host: internal verification QA"),
         }
         for login, raw_key in config.load_bootstrap_worker_keys().items():
             if not raw_key:
                 continue
             kh = hash_api_key(raw_key)
-            tiers = json.dumps(tier_defaults.get(login, ["tier-eval"]))
+            tiers_list, note = tier_defaults.get(login, (["tier-eval"], "Closed-pilot internal worker"))
+            tiers = json.dumps(tiers_list)
             conn.execute(
                 """INSERT INTO contributors (login, key_hash, is_admin, approved, tiers_json, note, created_at)
-                   VALUES (?, ?, 0, 1, ?, 'Closed-pilot internal worker', ?)
-                   ON CONFLICT(login) DO UPDATE SET key_hash=excluded.key_hash""",
-                (login, kh, tiers, now),
+                   VALUES (?, ?, 0, 1, ?, ?, ?)
+                   ON CONFLICT(login) DO UPDATE SET key_hash=excluded.key_hash, tiers_json=excluded.tiers_json, note=excluded.note""",
+                (login, kh, tiers, note, now),
             )
 
 

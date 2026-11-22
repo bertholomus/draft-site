@@ -21,7 +21,7 @@ def main() -> None:
     url = sys.argv[1]
     key_file = Path(sys.argv[2])
     keys = json.loads(key_file.read_text(encoding="utf-8"))
-    rt_key = keys["bertholomus-redteam"]
+    rt_key = keys["bertholomus-qa"]
     cli = DraftSiteClient(url, rt_key)
 
     results = []

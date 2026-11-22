@@ -76,7 +76,7 @@ def run_drafter_label(
 
     model_name = args.llm_model or plan.get("model_id") or "glm-5.3"
     max_tokens = int(plan.get("max_tokens", 256))
-    engine_tag = args.engine_tag or f"gr8-glm53-{socket.gethostname()}"
+    engine_tag = args.engine_tag or "gr8-glm53"
 
     # Load tokenizer for exact token ID encoding if available; else query completion token IDs / fallback
     tok = None
@@ -305,7 +305,7 @@ def run_drafter_eval(
         "checkpoint_rev": ckpt_rev,
         "profile_id": profile_id,
         "quant": eff_quant,
-        "device_class": torch.cuda.get_device_name(0) if use_cuda else f"cpu-{socket.gethostname()}",
+        "device_class": torch.cuda.get_device_name(0) if use_cuda else "cpu-worker",
         "selfcheck_max_err": _run_exlr8_selfcheck(dspine_dir, Path(args.release_dir) if args.release_dir else None),
         "n_shards": len(shard_files),
         "n_blocks": total_blocks,

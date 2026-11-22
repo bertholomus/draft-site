@@ -238,14 +238,13 @@ def get_grid(request: Request, job: str) -> dict[str, Any]:
                     "state": s["state"],
                     "contributor_login": holder,
                     "mine": mine,
-                    "host_tag": s["host_tag"],
                     "depends_on": f"{s['depends_on_job']}/{s['depends_on_slot']}" if s["depends_on_job"] else None,
                     "upload_bytes": s["upload_bytes"],
                     "upload_sha256": s["upload_sha256"],
                     "verify_status": s["verify_status"],
                     "verify_reason": s["verify_reason"],
                     "verified_at": s["verified_at"],
-                    "metrics": metrics,
+                    "metrics": {k: v for k, v in metrics.items() if k not in ("host_tag", "engines")},
                     "plan_summary": {k: plan[k] for k in ("codec", "profile_id", "checkpoint_rev", "local_steps", "n_prompts", "tap_layers") if k in plan},
                 }
             )
@@ -261,7 +260,6 @@ def get_grid(request: Request, job: str) -> dict[str, Any]:
                     "by_cat": metrics.get("by_cat"),
                     "pred_sha256": metrics.get("pred_sha256"),
                     "contributor_login": holder,
-                    "host_tag": s["host_tag"],
                     "quorum": metrics.get("quorum"),
                 }
 
@@ -345,7 +343,6 @@ def list_contributors(request: Request) -> list[dict[str, Any]]:
                     "rejected_attempts": max(rejected_total, int(audit_rej)),
                     "by_kind": by_kind,
                     "total_bytes_uploaded": total_bytes,
-                    "hosts": sorted(hosts),
                     "last_seen_at": c["last_seen_at"],
                 }
             )
@@ -362,20 +359,25 @@ def list_recent_audit(request: Request, limit: int = 50) -> list[dict[str, Any]]
             "SELECT id, ts, actor, action, job, slot_id, status, detail_json FROM audit_events ORDER BY id DESC LIMIT ?",
             (lim,),
         ).fetchall()
-        return [
-            {
-                "id": r["id"],
-                "ts": r["ts"],
-                "utc": db.utc_iso(r["ts"]),
-                "actor": r["actor"],
-                "action": r["action"],
-                "job": r["job"],
-                "slot_id": r["slot_id"],
-                "status": r["status"],
-                "detail": json.loads(r["detail_json"] or "{}"),
-            }
-            for r in rows
-        ]
+        out = []
+        for r in rows:
+            det = json.loads(r["detail_json"] or "{}")
+            # Never expose private host tags in public audit log
+            det.pop("host_tag", None)
+            out.append(
+                {
+                    "id": r["id"],
+                    "ts": r["ts"],
+                    "utc": db.utc_iso(r["ts"]),
+                    "actor": r["actor"],
+                    "action": r["action"],
+                    "job": r["job"],
+                    "slot_id": r["slot_id"],
+                    "status": r["status"],
+                    "detail": det,
+                }
+            )
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -1311,6 +1313,43 @@ async def admin_record_round_aggregate(request: Request, job: str, round_num: in
             {"agg_method": body.get("agg_method"), "agg_ckpt_name": body.get("agg_ckpt_name"), "agg_metrics": body.get("agg_metrics")},
         )
         return {"ok": True, "job": job, "round_num": round_num}
+
+
+@app.get("/api/admin/host-map")
+def admin_host_map(request: Request) -> list[dict[str, Any]]:
+    """Private admin-only mapping of neutral contributor logins to internal host tags and notes."""
+    _require_x_quant(request)
+    with db.tx() as conn:
+        _require_auth(conn, request, admin=True)
+        contribs = conn.execute(
+            "SELECT login, approved, quarantined, tiers_json, strikes, note, last_seen_at FROM contributors WHERE is_admin=0 ORDER BY login ASC"
+        ).fetchall()
+        out = []
+        for c in contribs:
+            host_rows = conn.execute(
+                "SELECT DISTINCT host_tag FROM slots WHERE (uploaded_by=? OR claimed_by=?) AND host_tag IS NOT NULL",
+                (c["login"], c["login"]),
+            ).fetchall()
+            audit_rows = conn.execute(
+                "SELECT detail_json FROM audit_events WHERE actor=? AND action='claim_created'",
+                (c["login"],),
+            ).fetchall()
+            hosts = {r["host_tag"] for r in host_rows if r["host_tag"]}
+            for ar in audit_rows:
+                ht = json.loads(ar["detail_json"] or "{}").get("host_tag")
+                if ht:
+                    hosts.add(ht)
+            out.append(
+                {
+                    "login": c["login"],
+                    "note": c["note"],
+                    "tiers": json.loads(c["tiers_json"] or "[]"),
+                    "strikes": c["strikes"],
+                    "observed_host_tags": sorted(hosts),
+                    "last_seen_at": c["last_seen_at"],
+                }
+            )
+        return out
 
 
 @app.get("/api/admin/pending-verifications")

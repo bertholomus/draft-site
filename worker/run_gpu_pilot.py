@@ -35,7 +35,7 @@ import eval_dspine_v3 as ev3  # noqa: E402
 import gpu_pilots as gp  # noqa: E402
 
 RUNNER = "drs-worker-v1.0.0"
-HOST_TAG = "mastersim-pro6000"
+HOST_TAG = "mastersim-pro6000"  # stored only in private admin host-map, never exposed on public API/UI
 
 
 def log(msg: str) -> None:
@@ -243,8 +243,8 @@ def main() -> None:
 
     keys = json.loads(Path(args.worker_keys_file).read_text())
     admin_key = Path(args.admin_key_file).read_text().strip()
-    wrk = DraftSiteClient(args.url, keys["bertholomus-mastersim"])
-    rt = DraftSiteClient(args.url, keys["bertholomus-redteam"])
+    wrk = DraftSiteClient(args.url, keys["bertholomus-w3"])
+    rt = DraftSiteClient(args.url, keys["bertholomus-qa"])
     adm = DraftSiteClient(args.url, admin_key)
 
     device = torch.device("cuda")

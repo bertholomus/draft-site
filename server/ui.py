@@ -411,7 +411,7 @@ async function selectJob(jobId) {
     else if (m.server_delta_l2_norm != null) mline = `L2=${m.server_delta_l2_norm} (${fmtBytes(s.upload_bytes)})`;
     else if (m.n_rows != null) mline = `${m.n_rows} rows · ${m.total_gen_tokens || m.n_tokens || 0} tok`;
     else if (s.depends_on && s.state === 'not_ready') mline = `awaits ${s.depends_on}`;
-    const by = s.contributor_login ? `by ${esc(s.contributor_login)}${s.host_tag ? ' @ '+esc(s.host_tag) : ''}` : '';
+    const by = s.contributor_login ? `by ${esc(s.contributor_login)}` : '';
     return `<div class="slot-cell st-${esc(s.state)}" title="${esc(s.verify_reason || s.state)}">
       <div class="sid">${esc(s.slot_id)}</div>
       <div class="st">${esc(s.state)} · ${esc(s.profile || s.col)}</div>
