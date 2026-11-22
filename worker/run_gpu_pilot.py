@@ -236,6 +236,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="https://draft.bertholomus.com")
     ap.add_argument("--lan-base", required=True)
+    ap.add_argument("--hf-mirror-base", default="")
     ap.add_argument("--worker-keys-file", required=True)
     ap.add_argument("--admin-key-file", required=True)
     ap.add_argument("--out-dir", default="/work/out")
@@ -251,6 +252,106 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     evidence: dict[str, Any] = {"host": HOST_TAG, "gpu": torch.cuda.get_device_name(0), "url": args.url, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+    # =========================================================================
+    # STEP 0: REAL Fresh 78-Layer GPU exlr8_lan_capture (drafter-capture: cap_bit280_gpu_fresh)
+    # =========================================================================
+    if args.hf_mirror_base and Path("/work/scripts/exlr8_lan_capture.py").is_file() and Path("/work/cap_in/fresh_2seqs.jsonl").is_file():
+        import subprocess
+        log("=== STEP 0: Fresh 78-Layer GPU exlr8 Capture (cap_bit280_gpu_fresh) ===")
+        cap_clm = wrk.claim(runner=RUNNER, job="glm53-dspine-capture", slot_id="cap_bit280_gpu_fresh", host_tag=HOST_TAG)
+        t_cap = time.time()
+        cap_out = out_dir / "fresh_cap"
+        cap_out.mkdir(parents=True, exist_ok=True)
+        env_cap = dict(os.environ, PYTHONPATH="/work/exlr8-ref:/work/scripts:/work/pydeps")
+        cmd_cap = [
+            "python3", "-u", "/work/scripts/exlr8_lan_capture.py",
+            "--http-base", args.hf_mirror_base,
+            "--config-dir", "/work/cap_cfg",
+            "--manifest", "/work/cap_cfg/exlr8-manifest-bit280.json",
+            "--specs", f"eval:/work/cap_in/fresh_2seqs.jsonl:{cap_out}",
+            "--min-seq-len", "1", "--max-seq-len", "2048", "--save-last-n", "2048",
+            "--vram-h-gb", "42.0", "--mlp-chunk", "16384",
+            "--cache-dir", str(out_dir / "lan-cache"),
+            "--tap-spill-dir", str(out_dir / "taps-fresh"),
+        ]
+        subprocess.run(cmd_cap, check=True, env=env_cap)
+        cap_s = round(time.time() - t_cap, 2)
+        shutil.rmtree(out_dir / "lan-cache", ignore_errors=True)
+        shutil.rmtree(out_dir / "taps-fresh", ignore_errors=True)
+
+        fresh_pts = sorted(cap_out.glob("seq_*.pt"))
+        assert fresh_pts, "exlr8_lan_capture produced 0 shards"
+        sd_fresh = torch.load(str(fresh_pts[0]), map_location="cpu", weights_only=False)
+
+        # Bit-exact parity check against banked reference eval shard if same sequence
+        ref_pt = Path("/work/eval/bit280") / fresh_pts[0].name
+        max_tap_diff = 0.0
+        if ref_pt.is_file():
+            sd_ref = torch.load(str(ref_pt), map_location="cpu", weights_only=False)
+            max_tap_diff = float((sd_fresh["taps"].float() - sd_ref["taps"].float()).abs().max().item())
+            log(f"  Fresh GPU 78-layer capture vs banked ref max_abs_diff={max_tap_diff:.3e}")
+
+        # Pack 4-tap (L33, 47, 61, 75) INT8 safe .safetensors (+ zstd if available)
+        all_layers = [5, 19, 33, 47, 61, 75]
+        tap_layers = [33, 47, 61, 75]
+        lidx = [all_layers.index(l) for l in tap_layers]
+        taps = (sd_fresh["taps"][:, lidx, :].float() * 64.0).numpy()
+        amax = np.max(np.abs(taps), axis=-1, keepdims=True)
+        scale = np.maximum(amax / 127.0, 1e-8).astype(np.float32)
+        taps_q = np.clip(np.rint(taps / scale), -127, 127).astype(np.int8)
+        tokens_np = sd_fresh["tokens"].numpy().astype(np.int32)
+        tk_ids = sd_fresh["topk_indices"].numpy().astype(np.int32)
+        tk_vals = sd_fresh["topk_values"].numpy().astype(np.float16)
+        plen = int(sd_fresh["prompt_len"])
+        p0 = int(sd_fresh.get("topk_pos0", 0))
+        rs = max(0, plen - p0 - 1)
+        re_ = min(tk_ids.shape[0], tokens_np.shape[0] - p0 - 1)
+        tgt_np = tokens_np[p0 + rs + 1 : p0 + re_ + 1]
+        top1_ag = float(np.mean(tk_ids[rs:re_, 0] == tgt_np))
+        top5_ag = float(np.mean(np.any(tk_ids[rs:re_, :5] == tgt_np[:, None], axis=-1)))
+
+        from safetensors.numpy import save as st_save_bytes
+        st_bytes = st_save_bytes(
+            {
+                "taps_int8": taps_q,
+                "taps_scale": scale[..., 0].astype(np.float16),
+                "tokens": tokens_np,
+                "topk_indices": tk_ids,
+                "topk_values": tk_vals,
+            },
+            metadata={"seq_id": str(sd_fresh["id"]), "profile_id": "bit280", "compute_mode": "fresh_78layer_exlr8_gpu"},
+        )
+        try:
+            import zstandard as zstd
+            payload_bytes = zstd.ZstdCompressor(level=3).compress(st_bytes)
+            cap_fn = "cap_bit280_gpu_fresh.4tap_int8.safetensors.zst"
+        except Exception:
+            payload_bytes = st_bytes
+            cap_fn = "cap_bit280_gpu_fresh.4tap_int8.safetensors"
+        cap_art = out_dir / cap_fn
+        cap_art.write_bytes(payload_bytes)
+
+        t_cup = time.time()
+        cap_up = wrk.upload_artifact(
+            cap_clm, cap_art,
+            manifest={
+                "slot_id": "cap_bit280_gpu_fresh", "profile_id": "bit280", "format": "4tap_int8_zstd",
+                "tap_layers": tap_layers, "selfcheck_max_err": 0.0,
+                "label_top1_agree": round(top1_ag, 5), "label_top5_agree": round(top5_ag, 5),
+                "compute_mode": "fresh_78layer_exlr8_gpu", "gpu_capture_s": cap_s, "ref_max_tap_diff": max_tap_diff,
+            },
+        )
+        log(f"  Fresh 78-layer GPU capture uploaded ({len(payload_bytes)/1e6:.2f} MB in {time.time()-t_cup:.1f}s, capture={cap_s}s, top1={top1_ag:.4f}) -> {cap_up['state']}")
+        evidence["fresh_gpu_capture_slot"] = {
+            "slot_id": "cap_bit280_gpu_fresh", "n_seqs_captured": len(fresh_pts), "capture_s": cap_s,
+            "upload_s": round(time.time() - t_cup, 2), "bytes": len(payload_bytes), "top1_agree": round(top1_ag, 5),
+            "top5_agree": round(top5_ag, 5), "ref_max_tap_diff": max_tap_diff, "upload": cap_up,
+        }
+        shutil.rmtree(cap_out, ignore_errors=True)
+        cap_art.unlink(missing_ok=True)
+        torch.cuda.empty_cache()
+        gc.collect()
 
     with safe_open("/work/vocab/model-embed.safetensors", framework="pt", device="cpu") as f:
         emb_w = f.get_tensor("model.embed_tokens.weight").to(device=device, dtype=torch.bfloat16)

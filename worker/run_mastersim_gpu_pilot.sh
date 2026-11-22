@@ -4,15 +4,18 @@ set -euo pipefail
 DSPINE=/tank/projects/glm53-dspine
 SITE=/tank/projects/draft-site
 PORT=19468
+HF_PORT=19469
 LEASE_ID=""
 FS_PID=""
+HF_PID=""
 
 log() { printf "[drs-ms %s] %s\n" "$(date -u +%H:%M:%SZ)" "$*"; }
 
 cleanup() {
   local rc=$?
-  ssh -o BatchMode=yes mastersim-linux "docker rm -f drs-gpu-pilot >/dev/null 2>&1 || true; docker run --rm -v /home/bertholomus/drs-work:/s alpine rm -rf /s/secrets /s/out /s/vocab /s/anchor /s/champion /s/eval /s/dumps >/dev/null 2>&1 || true; rm -rf /home/bertholomus/drs-work || true" || true
+  ssh -o BatchMode=yes mastersim-linux "docker rm -f drs-gpu-pilot >/dev/null 2>&1 || true; docker run --rm -v /home/bertholomus/drs-work:/s alpine rm -rf /s/secrets /s/out /s/vocab /s/anchor /s/champion /s/eval /s/dumps /s/exlr8-ref /s/pydeps /s/cap_cfg /s/cap_in >/dev/null 2>&1 || true; rm -rf /home/bertholomus/drs-work || true" || true
   [ -n "$FS_PID" ] && kill "$FS_PID" >/dev/null 2>&1 || true
+  [ -n "$HF_PID" ] && kill "$HF_PID" >/dev/null 2>&1 || true
   if [ -n "$LEASE_ID" ]; then
     log "Releasing gpulease ${LEASE_ID} (rc=${rc})"
     gpulease release "$LEASE_ID" >/dev/null 2>&1 || true
@@ -50,20 +53,23 @@ fi
 
 printf -- "- DRS NOTE acquired mastersim-pro6000 lease %s for closed community-drafter pilot (eval + 4w SparseLoCo train + Byzantine gate + offline champion score) %s\n" "$LEASE_ID" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${DSPINE}/PROGRESS.md"
 
-# 3. Ephemeral read-only LAN shard server on :19468
+# 3. Ephemeral read-only LAN shard server (:19468) + LAN HF mirror (:19469) for fresh 78-layer exlr8 GPU capture
 python3 -u "${DSPINE}/scripts/dspine_lan_fileserver.py" 0.0.0.0 "$PORT" >"${SITE}/notes/drs-lan-fs.log" 2>&1 &
 FS_PID=$!
+python3 -u "${DSPINE}/scripts/lan_hf_mirror.py" 0.0.0.0 "$HF_PORT" >"${SITE}/notes/drs-lan-hf.log" 2>&1 &
+HF_PID=$!
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   curl -sf "http://192.168.1.49:${PORT}/health" >/dev/null && break
   sleep 0.5
 done
 ssh -o BatchMode=yes mastersim-linux "curl -sf http://192.168.1.49:${PORT}/health >/dev/null"
-log "Ephemeral LAN shard server healthy on :${PORT}"
+log "Ephemeral LAN shard server (:${PORT}) and HF exlr8 mirror (:${HF_PORT}) healthy"
 
 # 4. Stage minimal read-only copies + keys into mastersim-linux:~/drs-work (335 GB free NVMe, wiped on exit!)
 W=/home/bertholomus/drs-work
 log "Staging vocab, anchor, champion, eval shards, dumps, scripts into mastersim-linux:${W}..."
-ssh -o BatchMode=yes mastersim-linux "rm -rf ${W} && mkdir -p ${W}/{vocab,anchor,champion,dumps,scripts/tools/convert,worker,secrets,out,eval/{bit200,bit240,bit280,bit322,bit400}} && chmod 700 ${W}/secrets"
+ssh -o BatchMode=yes mastersim-linux "rm -rf ${W} && mkdir -p ${W}/{vocab,anchor,champion,dumps,cap_cfg,cap_in,scripts/tools/convert,worker,secrets,out,eval/{bit200,bit240,bit280,bit322,bit400}} && chmod 700 ${W}/secrets && cp -a /home/bertholomus/r2-cap/exlr8-ref ${W}/exlr8-ref && cp -a /home/bertholomus/r2-cap/pydeps ${W}/pydeps && cp -a /home/bertholomus/r2-cap/cfg/* ${W}/cap_cfg/ && cp -a /home/bertholomus/r2-cap/scripts/{b1_capture.py,batch_bf16_capture_v3.py,exlr8_capture.py,exlr8_fast_attn.py,exlr8_fast_capture.py,exlr8_lan_capture.py} ${W}/scripts/"
+head -n 2 "${DSPINE}/data/labels/eval_labels.jsonl" | ssh -o BatchMode=yes mastersim-linux "cat > ${W}/cap_in/fresh_2seqs.jsonl"
 rsync -a "${DSPINE}/out/glm53-vocab-ref/" "mastersim-linux:${W}/vocab/"
 rsync -a "${DSPINE}/out/eval-dflash2-ref/" "mastersim-linux:${W}/anchor/"
 rsync -a "${DSPINE}/out/dspine-v5-s2-w5/best_dspine/" "mastersim-linux:${W}/champion/"
@@ -102,6 +108,7 @@ ssh -o BatchMode=yes mastersim-linux "docker rm -f drs-gpu-pilot >/dev/null 2>&1
   python3 -u /work/worker/run_gpu_pilot.py \
     --url https://draft.bertholomus.com \
     --lan-base http://192.168.1.49:${PORT} \
+    --hf-mirror-base http://192.168.1.49:${HF_PORT}/kindlingai/glm-5.3-exlr8-k2-k3-k4/resolve/main \
     --worker-keys-file /work/secrets/pilot_worker_keys.json \
     --admin-key-file /work/secrets/admin_api_key.txt \
     --out-dir /work/out" \
