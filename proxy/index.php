@@ -62,6 +62,7 @@ $passHeaderMap = [
     'HTTP_X_CONTENT_SHA256' => 'X-Content-SHA256',
     'HTTP_X_CHUNK_SHA256' => 'X-Chunk-SHA256',
     'HTTP_X_ARTIFACT_TYPE' => 'X-Artifact-Type',
+    'HTTP_X_MANIFEST_JSON' => 'X-Manifest-JSON',
     'HTTP_X_REQUEST_ID' => 'X-Request-ID',
     'HTTP_ACCEPT' => 'Accept',
     'HTTP_RANGE' => 'Range',

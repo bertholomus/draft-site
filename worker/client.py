@@ -211,20 +211,36 @@ class DraftSiteClient:
         chunk_tmpl = init_resp["chunk_url_template"]
         complete_url = init_resp["complete_url"]
 
-        with file_path.open("rb") as f:
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _send_chunk(idx: int, chunk: bytes) -> tuple[int, int]:
+            csha = hashlib.sha256(chunk).hexdigest()
+            url = chunk_tmpl.replace("{index}", str(idx))
+            self._request(
+                "PUT",
+                url,
+                raw_body=chunk,
+                headers={"Content-Type": "application/octet-stream", "X-Chunk-SHA256": csha},
+                retries=5,
+            )
+            return idx, len(chunk)
+
+        done_count = 0
+        with file_path.open("rb") as f, ThreadPoolExecutor(max_workers=4) as ex:
+            in_flight = []
             for idx in range(total_chunks):
                 chunk = f.read(chunk_bytes)
-                csha = hashlib.sha256(chunk).hexdigest()
-                url = chunk_tmpl.replace("{index}", str(idx))
-                self._request(
-                    "PUT",
-                    url,
-                    raw_body=chunk,
-                    headers={"Content-Type": "application/octet-stream", "X-Chunk-SHA256": csha},
-                    retries=5,
-                )
+                in_flight.append(ex.submit(_send_chunk, idx, chunk))
+                if len(in_flight) >= 8:
+                    _, nb = in_flight.pop(0).result()
+                    done_count += 1
+                    if progress_cb:
+                        progress_cb(done_count, total_chunks, nb)
+            for fut in in_flight:
+                _, nb = fut.result()
+                done_count += 1
                 if progress_cb:
-                    progress_cb(idx + 1, total_chunks, len(chunk))
+                    progress_cb(done_count, total_chunks, nb)
 
         return self._request("POST", complete_url, raw_body=b"", retries=3)
 

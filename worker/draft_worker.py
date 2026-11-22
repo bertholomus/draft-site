@@ -256,20 +256,18 @@ def run_drafter_eval(
             if not isinstance(tokens, torch.Tensor):
                 tokens = torch.tensor(tokens, dtype=torch.long)
 
-            q0s = list(range(max(pos0 + 1, plen), L - B, B))
+            q0s = list(range(max(pos0 + 16, plen - 1), L - B + 1, 8))[:48]
             if not q0s:
                 continue
             qpos = torch.tensor([[q0 + r for r in range(B)] for q0 in q0s], dtype=torch.long, device=device)
-            bids = torch.tensor([[int(tokens[q0 + r]) for r in range(B)] for q0 in q0s], dtype=torch.long, device=device)
+            bonus_ids = torch.tensor([int(tokens[q0]) for q0 in q0s], dtype=torch.long, device=device)
+            tgt = torch.tensor([[int(tokens[q0 + r]) for r in range(1, B)] for q0 in q0s], dtype=torch.long, device=device)
             N = len(q0s)
 
             with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-                ref_toks, bb_argmax, _, extra = model.draft_greedy(
-                    feat, cpos, bids[:, 0], qpos, emb_w, head_w, use_flex=False, fp32_refine=True
+                ref_pred, bb_pred, _, bb_logits = model.draft_greedy(
+                    feat, cpos, bonus_ids, qpos, emb_w, head_w, use_flex=False, fp32_refine=True
                 )
-            ref_pred = ref_toks[:, 1:]  # [N, B-1]
-            bb_pred = bb_argmax[:, 1:]  # [N, B-1]
-            tgt = bids[:, 1:]           # [N, B-1]
             pred_hasher.update(ref_pred.cpu().to(torch.int32).numpy().tobytes())
 
             bb_m = (bb_pred == tgt).int()
@@ -278,17 +276,10 @@ def run_drafter_eval(
             ref_acc16 = 1.0 + ref_m.cumprod(dim=-1).sum(dim=-1).float()
             ref_acc8 = 1.0 + ref_m[:, :7].cumprod(dim=-1).sum(dim=-1).float()
 
-            # Compute exact CE8 from backbone/refined hidden states
-            if isinstance(extra, dict) and "ref_logits" in extra:
-                rl = extra["ref_logits"][:, 1:8, :].float()
-                ce_val = torch.nn.functional.cross_entropy(rl.reshape(-1, rl.shape[-1]), tgt[:, :7].reshape(-1)).item()
-            else:
-                # Forward blocks for exact CE8
-                block_emb = emb_w[model.cfg.mask_token_id].view(1, 1, -1).expand(N, B, -1).clone()
-                block_emb[:, 0, :] = emb_w[bids[:, 0]]
-                out_fb = model.forward_blocks(feat, cpos, block_emb, qpos, bids, use_flex=False)
-                logits8 = torch.matmul(out_fb.hidden[:, 1:8, :].float(), head_w.float().t())
-                ce_val = torch.nn.functional.cross_entropy(logits8.reshape(-1, logits8.shape[-1]), tgt[:, :7].reshape(-1)).item()
+            ce_val = torch.nn.functional.cross_entropy(
+                bb_logits[:, :7, :].float().reshape(-1, bb_logits.shape[-1]),
+                tgt[:, :7].reshape(-1),
+            ).item()
 
             b8_refs.extend(ref_acc8.cpu().tolist())
             b16_bbs.extend(bb_acc16.cpu().tolist())
