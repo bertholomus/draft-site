@@ -1,0 +1,45 @@
+GLM-5.3 DSpine-Conv Drafter — Attribution and License Notice
+
+This work is a derivative drafter combining the Tencent DSpine architecture
+(adjacent causal injection, PCA-whitened unified transfer space, and exact-sender
+last-write refinement) with warm-started backbone and causal dynamic depthwise
+convolution weights from incoai/GLM-5.3-DFlash2, trained on exlr8-quantized
+GLM-5.3 hidden states and on-policy generations.
+
+Included / Derived Third-Party Components and Licenses:
+
+1. incoai/GLM-5.3-DFlash2 (Apache License 2.0)
+   - Source: https://huggingface.co/incoai/GLM-5.3-DFlash2
+   - Pinned Commit: 8f02251dc71a9da2053dfc15bfa293fbee5579b0 (2026-11-10, "Release under Apache 2.0")
+   - Authors / Copyright: Inco AI (z-lab / DFlash authors)
+   - License: Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
+   - Usage: Backbone transformer weights, context fusion (fc / hidden_norm),
+     causal 2-tap dynamic depthwise convolution modules (attention_conv / mlp_conv),
+     and Splash serving ideas (github.com/incoai/splash, Apache-2.0).
+
+2. Tencent DSpine (Apache License 2.0)
+   - Paper: "DSpine: Speculative Decoding with Adjacent Causal Injection" (arXiv:2609.36173)
+   - Authors: Zhang, Chen, Sun, Gu, Qiao, Sun, Jiang (Tencent)
+   - Source: https://github.com/Tencent/DSpine
+   - License: Apache License, Version 2.0
+
+3. GLM-5.3 Base Model (GLM-5.3 License)
+   - Source: https://huggingface.co/zai-org/GLM-5.3
+   - Authors / Copyright: Z.ai (Zhipu AI)
+   - Usage: Frozen token embeddings and lm_head transfer space; target model.
+
+4. KindlingAI GLM-5.3 exlr8 Quantization & gr8 Engine
+   - Weights: https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4 (rev 9e25c28a2e8808d8b2599d780521fd6af24e7558)
+     (GLM-5.3 License derivative; exlr8 packing/manifests CC BY 4.0; exllamav3 primitives MIT)
+   - Engine: https://github.com/kindlingai/gr8 (MIT License)
+
+5. Training Objective & Reference Implementations
+   - sgl-project/SpecForge PR #1038 & D-PACE position weighting (MIT License)
+   - NVIDIA Model-Optimizer PR #3435 / PR #3144 (Apache License 2.0)
+   - vLLM PR #67094 (Apache License 2.0)
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+these derivative weights or code except in compliance with the License. Unless
+required by applicable law or agreed to in writing, software distributed under
+the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS
+OF ANY KIND, either express or implied.
