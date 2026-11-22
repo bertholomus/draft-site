@@ -429,10 +429,10 @@ def run_owner_gate_and_aggregate(
     evals = []
     for p in pending:
         sid = p["slot_id"]
-        art_id = p["upload_artifact_id"]
+        art_id = p.get("artifact_id") or p.get("upload_artifact_id")
         dl_path = out_dir / f"{sid}_downloaded.safetensors"
         log(f"Downloading {sid} ({art_id}) via {adm.base_url}...")
-        adm.download_artifact(art_id, dl_path, p.get("upload_sha256"))
+        adm.download_artifact(art_id, dl_path, p.get("sha256") or p.get("upload_sha256"))
         t_g = time.time()
         d_f32 = unpack_safe_delta_f32(dl_path, ref_shapes)
         l2_n, cos_r = delta_norm_cos(d_f32, delta_root)
