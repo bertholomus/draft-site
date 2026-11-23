@@ -13,12 +13,15 @@ import shutil
 import sqlite3
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 
 from server import config, db, ui
 
@@ -36,7 +39,32 @@ PUBLIC_AUDIT_REDACT_KEYS = frozenset(
         "gate_metrics",
         "expected",
         "actual",
+        "key_id",
+        "old_key_id",
+        "new_key_id",
+        "prefix",
+        "api_key",
+        "api_key_shown_once",
+        "session_id",
+        "csrf_token",
+        "github_id",
+        "state",
+        "code",
+        "access_token",
+        "client_secret",
     )
+)
+
+CSP_STRICT = (
+    "default-src 'self'; "
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+    "font-src 'self' https://fonts.gstatic.com; "
+    "script-src 'self'; "
+    "img-src 'self' data:; "
+    "connect-src 'self'; "
+    "frame-ancestors 'none'; "
+    "base-uri 'self'; "
+    "form-action 'self'"
 )
 
 _VERIFY_SEMAPHORE: asyncio.Semaphore | None = None
@@ -109,6 +137,99 @@ def _is_owner(user: sqlite3.Row) -> bool:
     return str(user["login"]) in config.OWNER_LOGINS
 
 
+def _user_status(user: sqlite3.Row) -> str:
+    denied = False
+    try:
+        denied = bool(user["denied"])
+    except (KeyError, IndexError):
+        pass
+    if denied:
+        return "denied"
+    if bool(user["quarantined"]):
+        return "quarantined"
+    if not _is_owner(user) and int(user["strikes"]) >= config.MAX_STRIKES_BEFORE_QUARANTINE:
+        return "quarantined"
+    if not bool(user["approved"]):
+        return "pending"
+    return "approved"
+
+
+def _display_login(user: sqlite3.Row) -> str:
+    try:
+        gl = user["github_login"]
+        if gl:
+            return str(gl)
+    except (KeyError, IndexError):
+        pass
+    return str(user["login"])
+
+
+def _set_strict_cookie(response: Response, name: str, value: str, max_age: int) -> None:
+    """Set a __Host- compliant cookie (Secure, HttpOnly, SameSite=Lax, Path=/, no Domain)."""
+    response.set_cookie(
+        key=name,
+        value=value,
+        max_age=max_age,
+        path="/",
+        secure=True,
+        httponly=True,
+        samesite="lax",
+    )
+
+
+def _clear_strict_cookie(response: Response, name: str) -> None:
+    response.set_cookie(
+        key=name,
+        value="",
+        max_age=0,
+        expires=0,
+        path="/",
+        secure=True,
+        httponly=True,
+        samesite="lax",
+    )
+
+
+def _sanitize_return_to(raw: str | None) -> str:
+    """Allow ONLY same-site relative paths (blocks protocol-relative, backslash, scheme, control chars)."""
+    if not raw or not isinstance(raw, str) or len(raw) > 256:
+        return "/"
+    if raw != raw.strip():
+        return "/"
+    if "\\" in raw or any(ord(c) < 0x20 or ord(c) == 0x7F for c in raw):
+        return "/"
+    if not raw.startswith("/") or raw.startswith("//"):
+        return "/"
+    parsed = urllib.parse.urlsplit(raw)
+    if parsed.scheme or parsed.netloc:
+        return "/"
+    if not parsed.path.startswith("/") or parsed.path.startswith("//"):
+        return "/"
+    if parsed.path.startswith("/auth/"):
+        return "/"
+    return raw
+
+
+def _public_redirect(path: str) -> str:
+    safe_path = _sanitize_return_to(path)
+    return f"{config.PUBLIC_URL}{safe_path}"
+
+
+def _check_origin_header(req: Request) -> None:
+    """If Origin header is present on state-changing browser requests, require same-site match."""
+    origin = (req.headers.get("origin") or "").strip().rstrip("/")
+    if not origin:
+        return
+    allowed = {config.PUBLIC_URL.rstrip("/")}
+    if not req.headers.get("x-forwarded-host"):
+        host_hdr = (req.headers.get("host") or "").strip()
+        hostname = host_hdr.split(":")[0].lower()
+        if hostname in ("127.0.0.1", "localhost", "testserver"):
+            allowed.add(f"{req.url.scheme}://{host_hdr}".rstrip("/"))
+    if origin not in allowed:
+        raise HTTPException(status_code=403, detail="cross-origin request rejected")
+
+
 def _require_auth(
     conn: sqlite3.Connection,
     req: Request,
@@ -126,11 +247,115 @@ def _require_auth(
         if config.ADMIN_LOCAL_ONLY and req.headers.get("x-forwarded-for"):
             raise HTTPException(status_code=403, detail="admin API disabled over public proxy")
         return user
-    if not user["approved"] or user["quarantined"]:
-        raise HTTPException(status_code=403, detail="contributor account is not approved or is quarantined")
-    if not _is_owner(user) and int(user["strikes"]) >= config.MAX_STRIKES_BEFORE_QUARANTINE:
-        raise HTTPException(status_code=403, detail="contributor account is quarantined due to strikes")
+    status = _user_status(user)
+    if status != "approved":
+        raise HTTPException(status_code=403, detail=f"contributor account is not approved ({status})")
     return user
+
+
+def _require_session(
+    conn: sqlite3.Connection,
+    req: Request,
+    *,
+    require_approved: bool = True,
+    require_csrf: bool = False,
+    require_owner_admin: bool = False,
+    csrf_override: str | None = None,
+    touch: bool = False,
+) -> sqlite3.Row:
+    cookie_val = req.cookies.get(config.SESSION_COOKIE_NAME)
+    sess = db.lookup_session(conn, cookie_val, touch=touch)
+    if sess is None:
+        raise HTTPException(status_code=401, detail="active GitHub session required")
+    if require_csrf:
+        _check_origin_header(req)
+        provided = (csrf_override if csrf_override is not None else req.headers.get("x-csrf-token", "")).strip()
+        expected = str(sess["csrf_token"] or "")
+        if not provided or not expected or not hmac.compare_digest(provided, expected):
+            raise HTTPException(status_code=403, detail="missing or invalid CSRF token")
+    if require_approved and _user_status(sess) != "approved":
+        raise HTTPException(status_code=403, detail=f"account is {_user_status(sess)}; approval required")
+    if require_owner_admin:
+        if not _is_owner(sess) or _user_status(sess) != "approved" or sess["github_id"] is None:
+            raise HTTPException(status_code=403, detail="owner session required")
+    return sess
+
+
+def _require_admin_or_owner_session(
+    conn: sqlite3.Connection,
+    req: Request,
+    *,
+    require_csrf_for_session: bool = False,
+    touch_last_seen: bool = False,
+) -> sqlite3.Row:
+    """Admin Bearer (is_admin=1) OR signed-in owner GitHub browser session (+ CSRF on writes)."""
+    if _extract_bearer(req) is not None:
+        return _require_auth(conn, req, admin=True, touch_last_seen=touch_last_seen)
+    if req.cookies.get(config.SESSION_COOKIE_NAME):
+        return _require_session(
+            conn,
+            req,
+            require_approved=True,
+            require_csrf=require_csrf_for_session,
+            require_owner_admin=True,
+            touch=touch_last_seen,
+        )
+    raise HTTPException(status_code=401, detail="admin credential or owner session required")
+
+
+def exchange_github_code(
+    *,
+    code: str,
+    client_id: str,
+    client_secret: str,
+    redirect_uri: str,
+) -> dict[str, Any]:
+    """Server-side GitHub OAuth code exchange + read-only /user lookup (no secrets logged)."""
+    form_data = urllib.parse.urlencode(
+        {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "code": code,
+            "redirect_uri": redirect_uri,
+        }
+    ).encode("utf-8")
+    tok_req = urllib.request.Request(
+        config.GITHUB_TOKEN_URL,
+        data=form_data,
+        method="POST",
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "draft-site-oauth",
+        },
+    )
+    with urllib.request.urlopen(tok_req, timeout=15) as resp:
+        tok_payload = json.loads(resp.read().decode("utf-8"))
+    if not isinstance(tok_payload, dict) or not tok_payload.get("access_token"):
+        err = tok_payload.get("error_description") or tok_payload.get("error") if isinstance(tok_payload, dict) else "invalid token response"
+        raise RuntimeError(f"GitHub token exchange failed: {err}")
+    access_token = str(tok_payload["access_token"])
+
+    user_req = urllib.request.Request(
+        config.GITHUB_USER_API_URL,
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "draft-site-oauth",
+        },
+    )
+    with urllib.request.urlopen(user_req, timeout=15) as resp:
+        u = json.loads(resp.read().decode("utf-8"))
+    if not isinstance(u, dict):
+        raise RuntimeError("invalid GitHub user payload")
+    gh_id = u.get("id")
+    gh_login = str(u.get("login") or "").strip()
+    gh_name = str(u.get("name") or "").strip() or None
+    if not isinstance(gh_id, int) or isinstance(gh_id, bool) or gh_id <= 0 or not gh_login:
+        raise RuntimeError("GitHub user response missing valid numeric id or login")
+    return {"id": gh_id, "login": gh_login, "name": gh_name}
 
 
 def _safe_under(base: Path, target: Path) -> Path:
@@ -197,8 +422,6 @@ def _allowed_kinds_for_user(user: sqlite3.Row) -> set[str]:
 @app.middleware("http")
 async def security_and_origin_middleware(request: Request, call_next):
     # S4: Default-deny origin auth on ALL non-/healthz paths regardless of Host header.
-    # Only true loopback peers (127.0.0.1 / ::1) may bypass when explicitly enabled;
-    # traffic arriving via Docker bridge / Cloudflare Tunnel / reverse proxy MUST present X-Origin-Auth.
     if config.REQUIRE_ORIGIN_AUTH and request.url.path != "/healthz":
         peer = request.client.host if request.client else ""
         is_loopback = peer in ("127.0.0.1", "::1")
@@ -215,7 +438,8 @@ async def security_and_origin_middleware(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
-    if request.url.path.startswith("/api/"):
+    p = request.url.path
+    if p.startswith("/api/") or p.startswith("/auth/") or p in ("/", "/waiting", "/admin"):
         response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -261,19 +485,387 @@ def static_app_js() -> FileResponse:
 def index_page() -> HTMLResponse:
     return HTMLResponse(
         content=ui.render_index_html(),
-        headers={
-            "Cache-Control": "no-store",
-            "Content-Security-Policy": (
-                "default-src 'self'; "
-                "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-                "font-src 'self' https://fonts.gstatic.com; "
-                "script-src 'self'; "
-                "img-src 'self' data:; "
-                "connect-src 'self'; "
-                "frame-ancestors 'none'; base-uri 'self'"
-            ),
-        },
+        headers={"Cache-Control": "no-store", "Content-Security-Policy": CSP_STRICT},
     )
+
+
+@app.get("/waiting", response_class=HTMLResponse)
+def waiting_page(request: Request) -> Response:
+    with db.ro() as conn:
+        sess = db.lookup_session(conn, request.cookies.get(config.SESSION_COOKIE_NAME), touch=False)
+        if sess is None:
+            return RedirectResponse(url=_public_redirect("/"), status_code=302)
+        status = _user_status(sess)
+        if status == "approved":
+            return RedirectResponse(url=_public_redirect("/"), status_code=302)
+        html_body = ui.render_waiting_html(
+            github_login=_display_login(sess),
+            github_name=sess["github_name"],
+            status=status,
+            csrf_token=str(sess["csrf_token"]),
+        )
+    return HTMLResponse(
+        content=html_body,
+        headers={"Cache-Control": "no-store", "Content-Security-Policy": CSP_STRICT},
+    )
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page(request: Request) -> Response:
+    with db.ro() as conn:
+        sess = db.lookup_session(conn, request.cookies.get(config.SESSION_COOKIE_NAME), touch=False)
+        if sess is None:
+            return RedirectResponse(url=f"{config.PUBLIC_URL}/auth/login?next=/admin", status_code=302)
+        if not _is_owner(sess) or _user_status(sess) != "approved" or sess["github_id"] is None:
+            return HTMLResponse(
+                content=ui.render_auth_error_html("Forbidden", "Owner GitHub account required to view admin panel."),
+                status_code=403,
+                headers={"Cache-Control": "no-store", "Content-Security-Policy": CSP_STRICT},
+            )
+    return HTMLResponse(
+        content=ui.render_admin_html(),
+        headers={"Cache-Control": "no-store", "Content-Security-Policy": CSP_STRICT},
+    )
+
+
+# ---------------------------------------------------------------------------
+# GitHub OAuth Web Flow & Browser Sessions
+# ---------------------------------------------------------------------------
+
+@app.get("/auth/login")
+def auth_login(request: Request) -> Response:
+    oauth_cfg = config.load_github_oauth_config()
+    if oauth_cfg is None:
+        return HTMLResponse(
+            content=ui.render_auth_error_html(
+                "GitHub login unavailable",
+                "GitHub OAuth is not configured on the server yet. Please try again shortly.",
+            ),
+            status_code=503,
+            headers={"Cache-Control": "no-store", "Content-Security-Policy": CSP_STRICT},
+        )
+    client_id, _ = oauth_cfg
+    raw_next = request.query_params.get("next") or request.query_params.get("return_to")
+    return_to = _sanitize_return_to(raw_next)
+    state = secrets.token_urlsafe(32)
+    browser_nonce = secrets.token_urlsafe(32)
+    with db.tx(immediate=True) as conn:
+        db.create_oauth_state(conn, state, browser_nonce, return_to)
+
+    redirect_uri = f"{config.PUBLIC_URL}/auth/callback"
+    params = urllib.parse.urlencode(
+        {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "state": state,
+            "allow_signup": "false",
+        }
+    )
+    authorize_url = f"{config.GITHUB_AUTHORIZE_URL}?{params}"
+    resp = RedirectResponse(url=authorize_url, status_code=302, headers={"Cache-Control": "no-store"})
+    _set_strict_cookie(resp, config.OAUTH_STATE_COOKIE_NAME, browser_nonce, config.OAUTH_STATE_TTL_SEC)
+    return resp
+
+
+@app.get("/auth/callback")
+def auth_callback(request: Request) -> Response:
+    oauth_cfg = config.load_github_oauth_config()
+    if oauth_cfg is None:
+        resp = HTMLResponse(
+            content=ui.render_auth_error_html("GitHub login unavailable", "GitHub OAuth is not configured on the server."),
+            status_code=503,
+            headers={"Cache-Control": "no-store", "Content-Security-Policy": CSP_STRICT},
+        )
+        _clear_strict_cookie(resp, config.OAUTH_STATE_COOKIE_NAME)
+        return resp
+
+    err = (request.query_params.get("error") or "").strip()
+    if err:
+        err_desc = (request.query_params.get("error_description") or err)[:200]
+        resp = HTMLResponse(
+            content=ui.render_auth_error_html("GitHub login cancelled", f"GitHub returned an error: {err_desc}"),
+            status_code=400,
+            headers={"Cache-Control": "no-store", "Content-Security-Policy": CSP_STRICT},
+        )
+        _clear_strict_cookie(resp, config.OAUTH_STATE_COOKIE_NAME)
+        return resp
+
+    code = (request.query_params.get("code") or "").strip()
+    state = (request.query_params.get("state") or "").strip()
+    browser_nonce = (request.cookies.get(config.OAUTH_STATE_COOKIE_NAME) or "").strip()
+    if not code or not state or not browser_nonce:
+        resp = HTMLResponse(
+            content=ui.render_auth_error_html("Invalid login state", "Missing OAuth code, state, or browser state cookie."),
+            status_code=400,
+            headers={"Cache-Control": "no-store", "Content-Security-Policy": CSP_STRICT},
+        )
+        _clear_strict_cookie(resp, config.OAUTH_STATE_COOKIE_NAME)
+        return resp
+
+    with db.tx(immediate=True) as conn:
+        return_to = db.consume_oauth_state(conn, state, browser_nonce)
+    if return_to is None:
+        resp = HTMLResponse(
+            content=ui.render_auth_error_html("Invalid login state", "OAuth state is invalid, expired, or already used."),
+            status_code=400,
+            headers={"Cache-Control": "no-store", "Content-Security-Policy": CSP_STRICT},
+        )
+        _clear_strict_cookie(resp, config.OAUTH_STATE_COOKIE_NAME)
+        return resp
+
+    client_id, client_secret = oauth_cfg
+    redirect_uri = f"{config.PUBLIC_URL}/auth/callback"
+    try:
+        gh_user = exchange_github_code(
+            code=code,
+            client_id=client_id,
+            client_secret=client_secret,
+            redirect_uri=redirect_uri,
+        )
+    except Exception:
+        resp = HTMLResponse(
+            content=ui.render_auth_error_html("GitHub sign-in failed", "Could not verify your GitHub login. Please try again."),
+            status_code=502,
+            headers={"Cache-Control": "no-store", "Content-Security-Policy": CSP_STRICT},
+        )
+        _clear_strict_cookie(resp, config.OAUTH_STATE_COOKIE_NAME)
+        return resp
+
+    old_session = request.cookies.get(config.SESSION_COOKIE_NAME)
+    with db.tx(immediate=True) as conn:
+        user, created_pending = db.resolve_or_create_github_contributor(
+            conn,
+            github_id=int(gh_user["id"]),
+            github_login=str(gh_user["login"]),
+            github_name=gh_user.get("name"),
+        )
+        # Rotate session id at login (invalidating any pre-existing session cookie -> defeats fixation)
+        new_session_id, _csrf = db.create_session(conn, str(user["login"]), old_session_token=old_session)
+        status = _user_status(user)
+        action = "github_access_requested" if created_pending else "github_login"
+        db.log_audit(conn, str(user["login"]), action, status, detail={})
+
+    dest = _public_redirect(return_to) if status == "approved" else _public_redirect("/waiting")
+    resp = RedirectResponse(url=dest, status_code=302, headers={"Cache-Control": "no-store"})
+    _clear_strict_cookie(resp, config.OAUTH_STATE_COOKIE_NAME)
+    _set_strict_cookie(resp, config.SESSION_COOKIE_NAME, new_session_id, config.SESSION_IDLE_TTL_SEC)
+    return resp
+
+
+@app.get("/auth/me")
+def auth_me(request: Request) -> dict[str, Any]:
+    oauth_configured = config.load_github_oauth_config() is not None
+    touch_info: tuple[str, int] | None = None
+    with db.ro() as conn:
+        sess = db.lookup_session(conn, request.cookies.get(config.SESSION_COOKIE_NAME), touch=False)
+        if sess is None:
+            return {"authenticated": False, "oauth_configured": oauth_configured}
+        touch_info = (str(sess["session_hash"]), int(sess["session_last_seen_at"]))
+        status = _user_status(sess)
+        is_own = _is_owner(sess)
+        vcount = int(
+            conn.execute(
+                "SELECT COUNT(*) AS n FROM slots WHERE uploaded_by=? AND state='verified'",
+                (sess["login"],),
+            ).fetchone()["n"]
+        )
+        resp = {
+            "authenticated": True,
+            "oauth_configured": oauth_configured,
+            "status": status,
+            "login": str(sess["login"]),
+            "display_login": _display_login(sess),
+            "github_id": sess["github_id"],
+            "github_login": sess["github_login"],
+            "github_name": sess["github_name"],
+            "approved": bool(sess["approved"]),
+            "denied": bool(sess["denied"]),
+            "quarantined": bool(sess["quarantined"]),
+            "is_owner": is_own,
+            "can_admin_requests": bool(is_own and status == "approved" and sess["github_id"] is not None),
+            "tiers": json.loads(sess["tiers_json"] or "[]"),
+            "allowed_kinds": sorted(_allowed_kinds_for_user(sess)) if status == "approved" else [],
+            "strikes": int(sess["strikes"]),
+            "verified_slots": vcount,
+            "max_live_keys": config.MAX_LIVE_KEYS_PER_ACCOUNT,
+            "csrf_token": str(sess["csrf_token"]),
+        }
+    if touch_info is not None:
+        db.touch_session_if_stale(*touch_info)
+    return resp
+
+
+@app.post("/auth/logout")
+async def auth_logout(request: Request) -> Response:
+    _check_origin_header(request)
+    ctype = (request.headers.get("content-type") or "").lower()
+    csrf_from_body: str | None = None
+    is_form = "application/x-www-form-urlencoded" in ctype
+    if is_form:
+        raw = await _read_body_capped(request, 8192, "request body too large")
+        parsed = urllib.parse.parse_qs(raw.decode("utf-8", errors="replace"), keep_blank_values=True)
+        vals = parsed.get("csrf_token") or []
+        csrf_from_body = vals[0] if vals else ""
+    elif "application/json" in ctype:
+        raw = await _read_body_capped(request, 8192, "request body too large")
+        if raw.strip():
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+                if isinstance(obj, dict) and "csrf_token" in obj:
+                    csrf_from_body = str(obj["csrf_token"] or "")
+            except Exception:
+                pass
+
+    cookie_val = request.cookies.get(config.SESSION_COOKIE_NAME)
+    if cookie_val:
+        with db.tx(immediate=True) as conn:
+            sess = db.lookup_session(conn, cookie_val, touch=False)
+            if sess is not None:
+                provided = (request.headers.get("x-csrf-token") or csrf_from_body or "").strip()
+                expected = str(sess["csrf_token"] or "")
+                if not provided or not expected or not hmac.compare_digest(provided, expected):
+                    raise HTTPException(status_code=403, detail="missing or invalid CSRF token")
+                db.delete_session(conn, cookie_val)
+                db.log_audit(conn, str(sess["login"]), "github_logout", "ok", detail={})
+
+    if is_form:
+        resp: Response = RedirectResponse(url=_public_redirect("/"), status_code=303, headers={"Cache-Control": "no-store"})
+    else:
+        resp = JSONResponse(content={"ok": True}, headers={"Cache-Control": "no-store"})
+    _clear_strict_cookie(resp, config.SESSION_COOKIE_NAME)
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# Self-Service Worker API Keys (Session + CSRF + X-Quant: 1)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/keys")
+def list_my_keys(request: Request) -> dict[str, Any]:
+    _require_x_quant(request)
+    with db.ro() as conn:
+        sess = _require_session(conn, request, require_approved=True, require_csrf=False, touch=False)
+        rows = db.list_active_api_keys(conn, str(sess["login"]))
+        tiers = json.loads(sess["tiers_json"] or "[]")
+        allowed_kinds = sorted(_allowed_kinds_for_user(sess))
+        return {
+            "login": str(sess["login"]),
+            "display_login": _display_login(sess),
+            "max_live_keys": config.MAX_LIVE_KEYS_PER_ACCOUNT,
+            "tiers": tiers,
+            "allowed_kinds": allowed_kinds,
+            "keys": [
+                {
+                    "key_id": r["key_id"],
+                    "prefix": r["key_prefix"],
+                    "label": r["label"],
+                    "tiers": tiers,
+                    "allowed_kinds": allowed_kinds,
+                    "created_at": r["created_at"],
+                    "created_utc": db.utc_iso(r["created_at"]),
+                    "last_used_at": r["last_used_at"],
+                    "last_used_utc": db.utc_iso(r["last_used_at"]) if r["last_used_at"] is not None else None,
+                }
+                for r in rows
+            ],
+        }
+
+
+@app.post("/api/keys", status_code=201)
+async def create_my_key(request: Request) -> JSONResponse:
+    _require_x_quant(request)
+    label = ""
+    raw = await _read_body_capped(request, 8192, "request body too large")
+    if raw.strip():
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except Exception:
+            raise HTTPException(status_code=400, detail="valid JSON body required")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="JSON object required")
+        label = str(body.get("label") or "").strip()[:64]
+
+    with db.tx(immediate=True) as conn:
+        sess = _require_session(conn, request, require_approved=True, require_csrf=True, touch=True)
+        try:
+            meta, raw_key = db.create_api_key(conn, str(sess["login"]), label=label)
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        tiers = json.loads(sess["tiers_json"] or "[]")
+        allowed_kinds = sorted(_allowed_kinds_for_user(sess))
+        db.log_audit(conn, str(sess["login"]), "api_key_created", "ok", detail={"key_id": meta["key_id"], "prefix": meta["prefix"]})
+        return JSONResponse(
+            status_code=201,
+            content={
+                **meta,
+                "tiers": tiers,
+                "allowed_kinds": allowed_kinds,
+                "api_key_shown_once": raw_key,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+
+@app.post("/api/keys/{key_id}/rotate")
+async def rotate_my_key(request: Request, key_id: str) -> JSONResponse:
+    _require_x_quant(request)
+    _validate_id(key_id, "key_id")
+    label: str | None = None
+    raw = await _read_body_capped(request, 8192, "request body too large")
+    if raw.strip():
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except Exception:
+            raise HTTPException(status_code=400, detail="valid JSON body required")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="JSON object required")
+        if "label" in body and body["label"] is not None:
+            label = str(body["label"]).strip()[:64]
+
+    with db.tx(immediate=True) as conn:
+        sess = _require_session(conn, request, require_approved=True, require_csrf=True, touch=True)
+        res = db.rotate_api_key(conn, str(sess["login"]), key_id, label=label)
+        if res is None:
+            raise HTTPException(status_code=404, detail="active API key not found")
+        meta, raw_key = res
+        tiers = json.loads(sess["tiers_json"] or "[]")
+        allowed_kinds = sorted(_allowed_kinds_for_user(sess))
+        db.log_audit(
+            conn,
+            str(sess["login"]),
+            "api_key_rotated",
+            "ok",
+            detail={"old_key_id": key_id, "new_key_id": meta["key_id"], "prefix": meta["prefix"]},
+        )
+        return JSONResponse(
+            status_code=200,
+            content={
+                **meta,
+                "tiers": tiers,
+                "allowed_kinds": allowed_kinds,
+                "api_key_shown_once": raw_key,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+
+@app.delete("/api/keys/{key_id}")
+def revoke_my_key(request: Request, key_id: str) -> dict[str, Any]:
+    _require_x_quant(request)
+    _validate_id(key_id, "key_id")
+    with db.tx(immediate=True) as conn:
+        sess = _require_session(conn, request, require_approved=True, require_csrf=True, touch=True)
+        revoked = db.revoke_api_key(conn, str(sess["login"]), key_id)
+        if revoked is None:
+            raise HTTPException(status_code=404, detail="active API key not found")
+        db.log_audit(
+            conn,
+            str(sess["login"]),
+            "api_key_revoked",
+            "ok",
+            detail={"key_id": key_id, "prefix": revoked["prefix"]},
+        )
+        return {"ok": True, "revoked": True, "key_id": key_id}
 
 
 # ---------------------------------------------------------------------------
@@ -361,11 +953,17 @@ def get_grid(request: Request, job: str, offset: int = 0, limit: int = 500) -> d
     lim = max(1, min(1000, int(limit)))
     with db.ro() as conn:
         me = db.lookup_auth(conn, _extract_bearer(request), touch_last_seen=False)
+        if me is None:
+            me = db.lookup_session(conn, request.cookies.get(config.SESSION_COOKIE_NAME), touch=False)
         my_login = me["login"] if me else None
         j = conn.execute("SELECT * FROM jobs WHERE job=?", (job,)).fetchone()
         if j is None:
             raise HTTPException(status_code=404, detail=f"unknown job '{job}'")
         all_jobs = [r["job"] for r in conn.execute("SELECT job FROM jobs ORDER BY created_at ASC").fetchall()]
+        display_map = {
+            r["login"]: (r["github_login"] or r["login"])
+            for r in conn.execute("SELECT login, github_login FROM contributors").fetchall()
+        }
         total_slots = int(conn.execute("SELECT COUNT(*) AS n FROM slots WHERE job=?", (job,)).fetchone()["n"])
         slot_rows = conn.execute(
             """SELECT * FROM slots WHERE job=?
@@ -388,6 +986,7 @@ def get_grid(request: Request, job: str, offset: int = 0, limit: int = 500) -> d
             if s["state"] != "not_ready":
                 ready_rows.add(rk)
             holder = s["uploaded_by"] if s["state"] in ("uploaded", "verified", "rejected") else s["claimed_by"]
+            holder_disp = display_map.get(holder, holder) if holder else None
             mine = bool(my_login and holder == my_login)
             metrics = json.loads(s["metrics_json"] or "{}")
             plan = json.loads(s["plan_json"] or "{}")
@@ -400,6 +999,7 @@ def get_grid(request: Request, job: str, offset: int = 0, limit: int = 500) -> d
                     "profile": s["profile_id"],
                     "state": s["state"],
                     "contributor_login": holder,
+                    "display_login": holder_disp,
                     "mine": mine,
                     "depends_on": f"{s['depends_on_job']}/{s['depends_on_slot']}" if s["depends_on_job"] else None,
                     "upload_bytes": s["upload_bytes"],
@@ -425,7 +1025,7 @@ def get_grid(request: Request, job: str, offset: int = 0, limit: int = 500) -> d
                     "top1": metrics.get("top1"),
                     "by_cat": metrics.get("by_cat"),
                     "pred_sha256": metrics.get("pred_sha256"),
-                    "contributor_login": holder,
+                    "contributor_login": holder_disp or holder,
                     "quorum": metrics.get("quorum"),
                 }
 
@@ -469,11 +1069,14 @@ def get_grid(request: Request, job: str, offset: int = 0, limit: int = 500) -> d
 
 @app.get("/api/contributors")
 def list_contributors(request: Request) -> list[dict[str, Any]]:
-    """Public contributor leaderboard (S9: omits internal status, strikes, tiers, last_seen_at)."""
+    """Public contributor leaderboard (S9: omits internal status, strikes, tiers, last_seen_at, pending requests)."""
     _require_x_quant(request)
     with db.ro() as conn:
         contribs = conn.execute(
-            "SELECT login FROM contributors WHERE is_admin=0 ORDER BY login ASC"
+            """SELECT login, github_login FROM contributors
+               WHERE is_admin=0
+                 AND (approved=1 OR EXISTS (SELECT 1 FROM slots WHERE uploaded_by=contributors.login AND state='verified'))
+               ORDER BY login ASC"""
         ).fetchall()
         out: list[dict[str, Any]] = []
         for c in contribs:
@@ -501,6 +1104,7 @@ def list_contributors(request: Request) -> list[dict[str, Any]]:
             out.append(
                 {
                     "login": c["login"],
+                    "display_login": c["github_login"] or c["login"],
                     "verified_slots": verified_total,
                     "rejected_attempts": max(rejected_total, int(audit_rej)),
                     "by_kind": by_kind,
@@ -513,7 +1117,7 @@ def list_contributors(request: Request) -> list[dict[str, Any]]:
 
 @app.get("/api/audit")
 def list_recent_audit(request: Request, limit: int = 50) -> list[dict[str, Any]]:
-    """Public audit log (S5 & S9: strips artifact IDs, claim IDs, host tags, and threshold oracles)."""
+    """Public audit log (S5 & S9: strips artifact IDs, claim IDs, host tags, key/session metadata, and threshold oracles)."""
     _require_x_quant(request)
     lim = max(1, min(200, int(limit)))
     with db.ro() as conn:
@@ -547,11 +1151,13 @@ def list_recent_audit(request: Request, limit: int = 50) -> list[dict[str, Any]]
 @app.get("/api/me")
 def get_me(request: Request) -> dict[str, Any]:
     _require_x_quant(request)
+    touch_args: tuple[str | None, str, int | None] | None = None
     with db.ro() as conn:
         tok = _extract_bearer(request)
         user = db.lookup_auth(conn, tok, touch_last_seen=False)
         if user is None:
             raise HTTPException(status_code=401, detail="valid Authorization: Bearer <key> required")
+        touch_args = (user["auth_key_id"], str(user["login"]), user["auth_key_last_used_at"])
         vcount = conn.execute(
             "SELECT COUNT(*) AS n FROM slots WHERE uploaded_by=? AND state='verified'", (user["login"],)
         ).fetchone()["n"]
@@ -559,9 +1165,13 @@ def get_me(request: Request) -> dict[str, Any]:
             "SELECT COUNT(*) AS n FROM slots WHERE claimed_by=? AND state='claimed'", (user["login"],)
         ).fetchone()["n"]
         is_own = _is_owner(user)
-        return {
+        resp = {
             "login": user["login"],
+            "display_login": _display_login(user),
+            "github_id": user["github_id"],
+            "github_login": user["github_login"],
             "approved": bool(user["approved"]),
+            "denied": bool(user["denied"]),
             "admin": bool(user["is_admin"]),
             "owner": is_own,
             "quarantined": bool(user["quarantined"]),
@@ -572,6 +1182,9 @@ def get_me(request: Request) -> dict[str, Any]:
             "strikes": int(user["strikes"]),
             "verified_slots": int(vcount),
         }
+    if touch_args is not None:
+        db.touch_key_usage_if_stale(*touch_args)
+    return resp
 
 
 def _base_url_for_request(req: Request) -> str:
@@ -675,12 +1288,10 @@ async def create_claim(request: Request) -> JSONResponse:
         is_own = _is_owner(user)
         allowed_kinds = _allowed_kinds_for_user(user)
 
-        # Verify runner commit is accepted
         runner = conn.execute("SELECT * FROM runners WHERE commit_id=? AND active=1", (runner_commit,)).fetchone()
         if runner is None:
             raise HTTPException(status_code=400, detail=f"runner commit '{runner_commit}' not in /api/runners")
 
-        # Idempotent retry for same request_id by same contributor (does not double-count claim cap)
         prev = conn.execute(
             "SELECT * FROM slots WHERE request_id=? AND claimed_by=? AND state='claimed'",
             (req_id, user["login"]),
@@ -689,7 +1300,6 @@ async def create_claim(request: Request) -> JSONResponse:
             j = conn.execute("SELECT * FROM jobs WHERE job=?", (prev["job"],)).fetchone()
             return JSONResponse(status_code=201, content=_format_claim_response(prev, j, base_url=_base_url_for_request(request)))
 
-        # Check target job kind permissions BEFORE slot selection / claim cap
         if req_job:
             jcheck = conn.execute("SELECT * FROM jobs WHERE job=?", (req_job,)).fetchone()
             if jcheck is None:
@@ -703,7 +1313,6 @@ async def create_claim(request: Request) -> JSONResponse:
         if not allowed_kinds:
             raise HTTPException(status_code=403, detail="contributor has no permitted job kinds")
 
-        # Enforce per-login active claim cap (S7)
         active_claims = int(
             conn.execute(
                 "SELECT COUNT(*) AS n FROM slots WHERE state='claimed' AND claimed_by=?",
@@ -714,7 +1323,6 @@ async def create_claim(request: Request) -> JSONResponse:
         if active_claims >= cap:
             raise HTTPException(status_code=429, detail=f"active claim cap reached ({active_claims}/{cap})")
 
-        # Select target slot
         if req_job and req_slot:
             slot = conn.execute("SELECT * FROM slots WHERE job=? AND slot_id=?", (req_job, req_slot)).fetchone()
             if slot is None:
@@ -756,7 +1364,6 @@ async def create_claim(request: Request) -> JSONResponse:
         if runner["kind"] not in ("all", jkind):
             raise HTTPException(status_code=400, detail=f"runner kind '{runner['kind']}' cannot claim '{jkind}'")
 
-        # Prevent self-quorum on duplicate eval/pack slots
         if jkind in ("drafter-eval", "drafter-pack"):
             dup = conn.execute(
                 """SELECT 1 FROM slots
@@ -1009,7 +1616,6 @@ def _commit_upload_verdict(
         actual_sha = str(worker_res.get("actual_sha256") or "")
         actual_bytes = int(worker_res.get("actual_bytes") or (staged_file.stat().st_size if staged_file.is_file() else 0))
 
-        # Quarantine suspicious failed worker payloads; unlink trivial size/sha/assembly failures
         if err_code in ("failed_verify_worker", "failed_verify_timeout") and staged_file.is_file():
             q_path = _safe_under(config.QUARANTINE_DIR, config.QUARANTINE_DIR / f"{art_id}_{safe_fn}")
             shutil.move(str(staged_file), str(q_path))
@@ -1133,7 +1739,6 @@ def _commit_upload_verdict(
     if final_state == "verified":
         opened = db.trigger_downstream_readiness(conn, slot["job"], slot["slot_id"], art_id)
 
-    # S5: never include artifact_id in public audit detail
     db.log_audit(
         conn,
         user["login"],
@@ -1256,7 +1861,6 @@ async def init_chunked_upload(request: Request) -> JSONResponse:
     if total_bytes <= 0:
         raise HTTPException(status_code=400, detail="total_bytes must be positive")
 
-    # S6: Enforce chunk floor (MIN_CHUNK_BYTES for multi-chunk; single chunk allowed for small payloads)
     min_allowed = config.MIN_CHUNK_BYTES if total_bytes > config.MIN_CHUNK_BYTES else total_bytes
     if chunk_bytes < min_allowed or chunk_bytes > config.MAX_CHUNK_BYTES:
         raise HTTPException(
@@ -1362,7 +1966,6 @@ async def put_upload_chunk(request: Request, upload_id: str, index: int) -> dict
         config.MAX_CHUNK_BYTES,
         f"chunk size exceeds max {config.MAX_CHUNK_BYTES}",
     )
-    # S6: Exact per-chunk size enforcement
     if len(raw) != expected_len:
         raise HTTPException(
             status_code=422,
@@ -1373,7 +1976,6 @@ async def put_upload_chunk(request: Request, upload_id: str, index: int) -> dict
     if hdr_sha != chunk_sha:
         raise HTTPException(status_code=422, detail="X-Chunk-SHA256 mismatch")
 
-    # Write staged part outside SQLite write lock (atomic rename)
     part_path = _safe_under(config.STAGING_DIR, config.STAGING_DIR / upload_id / f"part_{index:06d}")
     part_path.parent.mkdir(parents=True, exist_ok=True)
     part_tmp = _safe_under(config.STAGING_DIR, config.STAGING_DIR / upload_id / f"part_{index:06d}.{secrets.token_hex(4)}.tmp")
@@ -1426,7 +2028,6 @@ async def complete_chunked_upload(request: Request, upload_id: str) -> JSONRespo
         if missing:
             raise HTTPException(status_code=400, detail=f"missing {len(missing)} chunks (first: {missing[:5]})")
 
-        # Claim exclusive ownership of finalizing this session so concurrent /complete calls fail with 404/409
         conn.execute("UPDATE upload_sessions SET state='verifying' WHERE upload_id=? AND state='open'", (upload_id,))
         vctx = _gather_verify_context(conn, user, slot, job_row)
         claim_id = str(sess["claim_id"])
@@ -1472,8 +2073,136 @@ async def complete_chunked_upload(request: Request, upload_id: str) -> JSONRespo
 
 
 # ---------------------------------------------------------------------------
-# Admin API (X-Quant: 1 + separate Admin Bearer credential ONLY)
+# Admin API (X-Quant: 1 + separate Admin Bearer credential; access-requests also supports owner GitHub session + CSRF)
 # ---------------------------------------------------------------------------
+
+@app.get("/api/admin/access-requests")
+def admin_list_access_requests(request: Request, status: str | None = None) -> list[dict[str, Any]]:
+    """List pending, approved, denied, and quarantined GitHub accounts for owner review."""
+    _require_x_quant(request)
+    with db.ro() as conn:
+        _require_admin_or_owner_session(conn, request, require_csrf_for_session=False)
+        rows = conn.execute(
+            """SELECT c.*,
+                      (SELECT COUNT(*) FROM api_keys k WHERE k.contributor_login = c.login AND k.revoked_at IS NULL) AS live_keys
+               FROM contributors c
+               WHERE c.is_admin = 0 AND (c.github_id IS NOT NULL OR c.approved = 0 OR c.denied = 1)
+               ORDER BY c.approved ASC, c.denied ASC, c.created_at DESC"""
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            st = _user_status(r)
+            if status and st != status:
+                continue
+            out.append(
+                {
+                    "login": r["login"],
+                    "display_login": _display_login(r),
+                    "github_id": r["github_id"],
+                    "github_login": r["github_login"],
+                    "github_name": r["github_name"],
+                    "status": st,
+                    "is_owner": bool(r["is_owner"]),
+                    "approved": bool(r["approved"]),
+                    "denied": bool(r["denied"]),
+                    "quarantined": bool(r["quarantined"]),
+                    "tiers": json.loads(r["tiers_json"] or "[]"),
+                    "strikes": int(r["strikes"]),
+                    "live_keys": int(r["live_keys"] or 0),
+                    "note": r["note"],
+                    "created_at": r["created_at"],
+                    "created_utc": db.utc_iso(r["created_at"]),
+                    "last_seen_at": r["last_seen_at"],
+                }
+            )
+        return out
+
+
+@app.post("/api/admin/access-requests/{login}/approve")
+async def admin_approve_access_request(request: Request, login: str) -> dict[str, Any]:
+    _require_x_quant(request)
+    _validate_id(login, "login")
+    body: dict[str, Any] = {}
+    raw = await _read_body_capped(request, 8192, "request body too large")
+    if raw.strip():
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+            if isinstance(parsed, dict):
+                body = parsed
+        except Exception:
+            raise HTTPException(status_code=400, detail="valid JSON body required")
+
+    with db.tx(immediate=True) as conn:
+        actor = _require_admin_or_owner_session(conn, request, require_csrf_for_session=True, touch_last_seen=True)
+        existing = conn.execute("SELECT * FROM contributors WHERE login=? AND is_admin=0", (login,)).fetchone()
+        if existing is None:
+            raise HTTPException(status_code=404, detail="contributor not found")
+        tiers = json.dumps(body["tiers"]) if "tiers" in body else (str(existing["tiers_json"] or "[]") if json.loads(existing["tiers_json"] or "[]") else json.dumps(["tier-label"]))
+        is_owner = (1 if body["is_owner"] else 0) if "is_owner" in body else int(existing["is_owner"])
+        quarantined = (1 if body["quarantined"] else 0) if "quarantined" in body else 0
+        note = body["note"] if "note" in body else (existing["note"] if existing["note"] != "Pending GitHub access request" else f"Approved by {actor['login']}")
+        conn.execute(
+            """UPDATE contributors
+               SET approved=1, denied=0, quarantined=?, is_owner=?, tiers_json=?, note=?
+               WHERE login=?""",
+            (quarantined, is_owner, tiers, note, login),
+        )
+        db.log_audit(conn, str(actor["login"]), "access_request_approved", "ok", detail={"login": login})
+        updated = conn.execute("SELECT * FROM contributors WHERE login=?", (login,)).fetchone()
+        return {
+            "ok": True,
+            "login": updated["login"],
+            "display_login": _display_login(updated),
+            "status": _user_status(updated),
+            "approved": bool(updated["approved"]),
+            "denied": bool(updated["denied"]),
+            "quarantined": bool(updated["quarantined"]),
+            "is_owner": bool(updated["is_owner"]),
+            "tiers": json.loads(updated["tiers_json"] or "[]"),
+        }
+
+
+@app.post("/api/admin/access-requests/{login}/deny")
+async def admin_deny_access_request(request: Request, login: str) -> dict[str, Any]:
+    _require_x_quant(request)
+    _validate_id(login, "login")
+    body: dict[str, Any] = {}
+    raw = await _read_body_capped(request, 8192, "request body too large")
+    if raw.strip():
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+            if isinstance(parsed, dict):
+                body = parsed
+        except Exception:
+            raise HTTPException(status_code=400, detail="valid JSON body required")
+
+    with db.tx(immediate=True) as conn:
+        actor = _require_admin_or_owner_session(conn, request, require_csrf_for_session=True, touch_last_seen=True)
+        existing = conn.execute("SELECT * FROM contributors WHERE login=? AND is_admin=0", (login,)).fetchone()
+        if existing is None:
+            raise HTTPException(status_code=404, detail="contributor not found")
+        if str(existing["login"]) == str(actor["login"]) or bool(existing["is_owner"]):
+            raise HTTPException(status_code=400, detail="cannot deny an owner account")
+        note = body["note"] if "note" in body else f"Denied by {actor['login']}"
+        conn.execute(
+            "UPDATE contributors SET approved=0, denied=1, note=? WHERE login=?",
+            (note, login),
+        )
+        revoked_keys = db.revoke_all_api_keys(conn, login)
+        revoked_sessions = db.delete_user_sessions(conn, login)
+        db.log_audit(conn, str(actor["login"]), "access_request_denied", "ok", detail={"login": login})
+        updated = conn.execute("SELECT * FROM contributors WHERE login=?", (login,)).fetchone()
+        return {
+            "ok": True,
+            "login": updated["login"],
+            "display_login": _display_login(updated),
+            "status": _user_status(updated),
+            "approved": False,
+            "denied": True,
+            "revoked_keys": revoked_keys,
+            "revoked_sessions": revoked_sessions,
+        }
+
 
 @app.post("/api/admin/runners")
 async def admin_add_runner(request: Request) -> dict[str, Any]:
@@ -1513,57 +2242,84 @@ async def admin_upsert_contributor(request: Request) -> dict[str, Any]:
     with db.tx(immediate=True) as conn:
         admin = _require_auth(conn, request, admin=True, touch_last_seen=True)
         existing = conn.execute("SELECT * FROM contributors WHERE login=?", (login,)).fetchone()
+        now = db.utc_ms()
         if existing is None:
             approved = 1 if body.get("approved", True) else 0
+            denied = 1 if body.get("denied", False) else 0
             quarantined = 1 if body.get("quarantined", False) else 0
             is_owner = 1 if body.get("is_owner", False) else 0
             tiers = json.dumps(body["tiers"] if "tiers" in body else ["tier-label"])
             note = body.get("note")
             strikes = int(body.get("strikes", 0))
+            github_id = int(body["github_id"]) if body.get("github_id") is not None else None
+            github_login = str(body["github_login"]).strip()[:100] if body.get("github_login") else None
             raw_key = "drs_wrk_" + secrets.token_urlsafe(32)
             kh = db.hash_api_key(raw_key)
             conn.execute(
                 """INSERT INTO contributors
-                   (login, key_hash, is_admin, is_owner, approved, tiers_json, strikes, quarantined, note, created_at)
-                   VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?)""",
-                (login, kh, is_owner, approved, tiers, strikes, quarantined, note, db.utc_ms()),
+                   (login, key_hash, is_admin, is_owner, approved, denied, tiers_json, strikes, quarantined, note, github_id, github_login, created_at)
+                   VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (login, kh, is_owner, approved, denied, tiers, strikes, quarantined, note, github_id, github_login, now),
+            )
+            kid = "key_" + secrets.token_hex(8)
+            conn.execute(
+                """INSERT INTO api_keys (key_id, contributor_login, key_hash, key_prefix, label, created_at, last_used_at, revoked_at)
+                   VALUES (?, ?, ?, ?, 'Admin issued', ?, NULL, NULL)""",
+                (kid, login, kh, db.key_prefix(raw_key), now),
             )
         else:
             # S10: Preserve every field omitted from the update payload!
             approved = (1 if body["approved"] else 0) if "approved" in body else int(existing["approved"])
+            denied = (1 if body["denied"] else 0) if "denied" in body else int(existing["denied"])
             quarantined = (1 if body["quarantined"] else 0) if "quarantined" in body else int(existing["quarantined"])
             is_owner = (1 if body["is_owner"] else 0) if "is_owner" in body else int(existing["is_owner"])
             tiers = json.dumps(body["tiers"]) if "tiers" in body else str(existing["tiers_json"])
             note = body["note"] if "note" in body else existing["note"]
             strikes = int(body["strikes"]) if "strikes" in body else int(existing["strikes"])
+            github_id = (int(body["github_id"]) if body["github_id"] is not None else None) if "github_id" in body else existing["github_id"]
+            github_login = (str(body["github_login"]).strip()[:100] if body["github_login"] else None) if "github_login" in body else existing["github_login"]
             if body.get("rotate_key"):
                 raw_key = "drs_wrk_" + secrets.token_urlsafe(32)
                 kh = db.hash_api_key(raw_key)
                 conn.execute(
+                    "UPDATE api_keys SET revoked_at=? WHERE contributor_login=? AND revoked_at IS NULL",
+                    (now, login),
+                )
+                kid = "key_" + secrets.token_hex(8)
+                conn.execute(
+                    """INSERT INTO api_keys (key_id, contributor_login, key_hash, key_prefix, label, created_at, last_used_at, revoked_at)
+                       VALUES (?, ?, ?, ?, 'Admin rotated', ?, NULL, NULL)""",
+                    (kid, login, kh, db.key_prefix(raw_key), now),
+                )
+                conn.execute(
                     """UPDATE contributors
-                       SET key_hash=?, is_owner=?, approved=?, tiers_json=?, strikes=?, quarantined=?, note=?
+                       SET key_hash=?, is_owner=?, approved=?, denied=?, tiers_json=?, strikes=?, quarantined=?, note=?, github_id=?, github_login=?
                        WHERE login=?""",
-                    (kh, is_owner, approved, tiers, strikes, quarantined, note, login),
+                    (kh, is_owner, approved, denied, tiers, strikes, quarantined, note, github_id, github_login, login),
                 )
             else:
                 conn.execute(
                     """UPDATE contributors
-                       SET is_owner=?, approved=?, tiers_json=?, strikes=?, quarantined=?, note=?
+                       SET is_owner=?, approved=?, denied=?, tiers_json=?, strikes=?, quarantined=?, note=?, github_id=?, github_login=?
                        WHERE login=?""",
-                    (is_owner, approved, tiers, strikes, quarantined, note, login),
+                    (is_owner, approved, denied, tiers, strikes, quarantined, note, github_id, github_login, login),
                 )
+            if "denied" in body and denied == 1:
+                db.revoke_all_api_keys(conn, login)
+                db.delete_user_sessions(conn, login)
 
         db.log_audit(
             conn,
             admin["login"],
             "contributor_updated",
             "ok",
-            detail={"login": login, "approved": bool(approved), "quarantined": bool(quarantined), "is_owner": bool(is_owner)},
+            detail={"login": login, "approved": bool(approved), "denied": bool(denied), "quarantined": bool(quarantined), "is_owner": bool(is_owner)},
         )
         resp: dict[str, Any] = {
             "ok": True,
             "login": login,
             "approved": bool(approved),
+            "denied": bool(denied),
             "quarantined": bool(quarantined),
             "is_owner": bool(is_owner),
             "tiers": json.loads(tiers),
@@ -1748,7 +2504,6 @@ async def admin_record_verification(request: Request, job: str, slot_id: str) ->
             )
             return {"ok": True, "state": "verified", "verify_status": verify_status, "opened_downstream": opened}
 
-        # Failed Owner Gate -> move artifact to quarantine, add strike (+ auto-quarantine at 3), reopen slot if requested
         art_id = slot["upload_artifact_id"]
         if art_id:
             art = conn.execute("SELECT * FROM artifacts WHERE artifact_id=?", (art_id,)).fetchone()
@@ -1862,7 +2617,7 @@ def admin_host_map(request: Request) -> list[dict[str, Any]]:
     with db.ro() as conn:
         _require_auth(conn, request, admin=True)
         contribs = conn.execute(
-            "SELECT login, is_owner, approved, quarantined, tiers_json, strikes, note, last_seen_at FROM contributors WHERE is_admin=0 ORDER BY login ASC"
+            "SELECT login, github_id, github_login, is_owner, approved, denied, quarantined, tiers_json, strikes, note, last_seen_at FROM contributors WHERE is_admin=0 ORDER BY login ASC"
         ).fetchall()
         out = []
         for c in contribs:
@@ -1882,8 +2637,11 @@ def admin_host_map(request: Request) -> list[dict[str, Any]]:
             out.append(
                 {
                     "login": c["login"],
+                    "github_id": c["github_id"],
+                    "github_login": c["github_login"],
                     "is_owner": bool(c["is_owner"]),
                     "approved": bool(c["approved"]),
+                    "denied": bool(c["denied"]),
                     "quarantined": bool(c["quarantined"]),
                     "note": c["note"],
                     "tiers": json.loads(c["tiers_json"] or "[]"),

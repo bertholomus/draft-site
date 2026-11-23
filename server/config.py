@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 from pathlib import Path
+from typing import Any
 
 DATA_DIR = Path(os.environ.get("DRAFT_DATA_DIR", "/data")).resolve()
 SECRETS_DIR = Path(os.environ.get("DRAFT_SECRETS_DIR", "/secrets")).resolve()
@@ -20,6 +22,49 @@ REQUIRE_ORIGIN_AUTH = os.environ.get("DRAFT_REQUIRE_ORIGIN_AUTH", "1") == "1"
 ALLOW_LOOPBACK_NO_ORIGIN_AUTH = os.environ.get("DRAFT_ALLOW_LOOPBACK_NO_ORIGIN_AUTH", "1") == "1"
 ADMIN_LOCAL_ONLY = os.environ.get("DRAFT_ADMIN_LOCAL_ONLY", "0") == "1"
 BOOTSTRAP_WORKER_KEYS = os.environ.get("DRAFT_BOOTSTRAP_WORKER_KEYS", "0") == "1"
+
+# GitHub OAuth & Session configuration
+SESSION_COOKIE_NAME = "__Host-drs_session"
+OAUTH_STATE_COOKIE_NAME = "__Host-drs_oauth_state"
+SESSION_IDLE_TTL_SEC = int(os.environ.get("DRAFT_SESSION_IDLE_TTL_SEC", str(30 * 24 * 3600)))
+OAUTH_STATE_TTL_SEC = int(os.environ.get("DRAFT_OAUTH_STATE_TTL_SEC", "600"))
+MAX_LIVE_KEYS_PER_ACCOUNT = int(os.environ.get("DRAFT_MAX_LIVE_KEYS", "2"))
+
+GITHUB_AUTHORIZE_URL = os.environ.get("DRAFT_GITHUB_AUTHORIZE_URL", "https://github.com/login/oauth/authorize")
+GITHUB_TOKEN_URL = os.environ.get("DRAFT_GITHUB_TOKEN_URL", "https://github.com/login/oauth/access_token")
+GITHUB_USER_API_URL = os.environ.get("DRAFT_GITHUB_USER_API_URL", "https://api.github.com/user")
+
+# Pre-approved GitHub accounts mapped to existing contributor rows (numeric GitHub IDs resolved from api.github.com)
+PREAPPROVED_GITHUB_ACCOUNTS: dict[str, dict[str, Any]] = {
+    "bertholomus": {
+        "site_login": "bertholomus",
+        "github_id": 311723197,
+        "is_owner": True,
+        "tiers": ["tier-label", "tier-train", "tier-eval", "tier-capture", "tier-pack"],
+        "note": "Owner account (GitHub)",
+    },
+    "mmastrac": {
+        "site_login": "mmastrac",
+        "github_id": 512240,
+        "is_owner": False,
+        "tiers": ["tier-label"],
+        "note": "Matt Mastracci (KindlingAI); label-only",
+    },
+    "chuck-ads": {
+        "site_login": "ck2084",
+        "github_id": 268695057,
+        "is_owner": False,
+        "tiers": ["tier-label"],
+        "note": "Chuck (KindlingAI); label-only",
+    },
+    "coffee-the-dev": {
+        "site_login": "coffeedev",
+        "github_id": 137969418,
+        "is_owner": False,
+        "tiers": ["tier-label"],
+        "note": "Steve (KindlingAI, GitHub coffee-the-dev); label-only",
+    },
+}
 
 # Strict upload & verification limits (S6)
 MAX_DIRECT_UPLOAD_BYTES = 12 * 1024 * 1024  # 12 MiB
@@ -60,7 +105,7 @@ OWNER_LOGINS = frozenset(
     x.strip()
     for x in os.environ.get(
         "DRAFT_OWNER_LOGINS",
-        "admin,bertholomus-w1,bertholomus-w2,bertholomus-w3,bertholomus-w4,"
+        "admin,bertholomus,bertholomus-w1,bertholomus-w2,bertholomus-w3,bertholomus-w4,"
         "bertholomus-w5,bertholomus-w6,bertholomus-w7,bertholomus-w8,bertholomus-qa",
     ).split(",")
     if x.strip()
@@ -90,6 +135,8 @@ TRAIN_MAX_DELTA_CE8 = -0.005
 TRAIN_NORM_RATIO_MIN = 0.30
 TRAIN_NORM_RATIO_MAX = 2.50
 
+_EPHEMERAL_SESSION_SECRET: bytes | None = None
+
 
 def load_origin_auth_secret() -> str:
     p = SECRETS_DIR / "origin_auth.secret"
@@ -103,6 +150,42 @@ def load_bootstrap_admin_key() -> str:
     if p.is_file():
         return p.read_text(encoding="utf-8").strip()
     return os.environ.get("DRAFT_ADMIN_API_KEY", "").strip()
+
+
+def load_github_oauth_config() -> tuple[str, str] | None:
+    """Load GitHub OAuth client_id and client_secret from read-only secrets dir (never cached statically)."""
+    p = SECRETS_DIR / "github_oauth.json"
+    if p.is_file():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                cid = str(data.get("client_id") or "").strip()
+                csec = str(data.get("client_secret") or "").strip()
+                if cid and csec:
+                    return (cid, csec)
+        except Exception:
+            return None
+    cid = os.environ.get("DRAFT_GITHUB_CLIENT_ID", "").strip()
+    csec = os.environ.get("DRAFT_GITHUB_CLIENT_SECRET", "").strip()
+    if cid and csec:
+        return (cid, csec)
+    return None
+
+
+def load_session_secret() -> bytes:
+    """Load HMAC key for sessions and OAuth state from read-only secrets dir."""
+    global _EPHEMERAL_SESSION_SECRET
+    p = SECRETS_DIR / "session.secret"
+    if p.is_file():
+        raw = p.read_text(encoding="utf-8").strip()
+        if raw:
+            return raw.encode("utf-8")
+    env_val = os.environ.get("DRAFT_SESSION_SECRET", "").strip()
+    if env_val:
+        return env_val.encode("utf-8")
+    if _EPHEMERAL_SESSION_SECRET is None:
+        _EPHEMERAL_SESSION_SECRET = secrets.token_bytes(32)
+    return _EPHEMERAL_SESSION_SECRET
 
 
 def load_bootstrap_worker_keys() -> dict[str, str]:

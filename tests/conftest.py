@@ -11,6 +11,9 @@ from fastapi.testclient import TestClient
 
 ORIGIN_SECRET = "test_origin_secret_hex_1234567890abcdef"
 ADMIN_KEY = "drs_adm_test_admin_key_0123456789abcdef"
+SESSION_SECRET = "test_session_hmac_secret_0123456789abcdef0123456789abcdef"
+OAUTH_CLIENT_ID = "Iv1.testclientid1234"
+OAUTH_CLIENT_SECRET = "test_github_oauth_client_secret_9876543210"
 
 
 @pytest.fixture()
@@ -21,6 +24,11 @@ def site_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     sec_dir.mkdir(parents=True, exist_ok=True)
     (sec_dir / "origin_auth.secret").write_text(ORIGIN_SECRET, encoding="utf-8")
     (sec_dir / "admin_api_key.txt").write_text(ADMIN_KEY, encoding="utf-8")
+    (sec_dir / "session.secret").write_text(SESSION_SECRET, encoding="utf-8")
+    (sec_dir / "github_oauth.json").write_text(
+        json.dumps({"client_id": OAUTH_CLIENT_ID, "client_secret": OAUTH_CLIENT_SECRET}),
+        encoding="utf-8",
+    )
 
     monkeypatch.setenv("DRAFT_DATA_DIR", str(data_dir))
     monkeypatch.setenv("DRAFT_SECRETS_DIR", str(sec_dir))
@@ -38,6 +46,7 @@ def site_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(config, "VERIFIED_DIR", data_dir / "uploads" / "verified")
     monkeypatch.setattr(config, "QUARANTINE_DIR", data_dir / "uploads" / "quarantine")
     monkeypatch.setattr(config, "EVALS_DIR", data_dir / "evals")
+    monkeypatch.setattr(config, "PUBLIC_URL", "https://draft.bertholomus.com")
     monkeypatch.setattr(config, "REQUIRE_ORIGIN_AUTH", True)
     monkeypatch.setattr(config, "BOOTSTRAP_WORKER_KEYS", False)
     monkeypatch.setattr(config, "MAX_ACTIVE_CLAIMS_PER_LOGIN", 2)
@@ -47,6 +56,8 @@ def site_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(config, "LABEL_GATE_TRUSTED_LOGINS", frozenset({"bertholomus-w1"}))
     monkeypatch.setattr(config, "NON_OWNER_ALLOWED_KINDS", frozenset({"drafter-label"}))
     monkeypatch.setattr(config, "CLAIM_RATE_LIMIT_PER_MIN", 200)
+    monkeypatch.setattr(config, "MAX_LIVE_KEYS_PER_ACCOUNT", 2)
+    monkeypatch.setattr(config, "SESSION_IDLE_TTL_SEC", 30 * 24 * 3600)
 
     srv_app._CLAIM_RATE_BUCKETS.clear()
     srv_app._VERIFY_SEMAPHORE = None
@@ -55,7 +66,7 @@ def site_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     origin_hdr = {"X-Origin-Auth": ORIGIN_SECRET}
     adm_hdr = {"X-Origin-Auth": ORIGIN_SECRET, "X-Quant": "1", "Authorization": f"Bearer {ADMIN_KEY}"}
 
-    with TestClient(srv_app.app) as client:
+    with TestClient(srv_app.app, base_url="https://draft.bertholomus.com") as client:
         def mint_user(
             login: str,
             *,
@@ -77,8 +88,12 @@ def site_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
             key = r.json()["api_key_shown_once"]
             return key, {"X-Origin-Auth": ORIGIN_SECRET, "X-Quant": "1", "Authorization": f"Bearer {key}"}
 
+        def new_browser() -> TestClient:
+            return TestClient(srv_app.app, base_url="https://draft.bertholomus.com")
+
         yield {
             "client": client,
+            "new_browser": new_browser,
             "data_dir": data_dir,
             "secrets_dir": sec_dir,
             "origin_hdr": origin_hdr,

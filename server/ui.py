@@ -1,19 +1,9 @@
-"""Web UI for draft.bertholomus.com — hardened CSP (no inline scripts) and accurate security docs."""
+"""Web UI for draft.bertholomus.com — hardened CSP (no inline scripts), GitHub OAuth login, self-service API keys, and owner admin view."""
 from __future__ import annotations
 
+import html
 
-def render_index_html() -> str:
-    return r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>draft.bertholomus.com · GLM-5.3 Drafter Label Coordinator</title>
-<meta name="description" content="Trusted-contributor label coordinator for GLM-5.3 DSpine B=16 drafter training.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<style>
+COMMON_STYLE = r"""
 :root { color-scheme: dark;
   --ink: #16130F; --paper: #F2EDE4;
   --bg: var(--ink); --fg: var(--paper);
@@ -63,11 +53,24 @@ header.top {
   border: 1px solid var(--line); background: var(--surface); font: 12px var(--font-mono); color: var(--muted);
 }
 .pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--good); }
+.pill .dot-warn { width: 7px; height: 7px; border-radius: 50%; background: var(--claimed); }
 .btn {
+  display: inline-flex; align-items: center; gap: 6px;
   border: 1px solid var(--line); background: var(--surface); color: var(--fg);
   padding: 6px 12px; border-radius: 8px; font: 500 13px var(--font-mono); cursor: pointer;
+  text-decoration: none;
 }
-.btn:hover { border-color: var(--accent); color: var(--accent-text); }
+.btn:hover { border-color: var(--accent); color: var(--accent-text); text-decoration: none; }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn-accent { border-color: var(--accent); background: var(--accent); color: #16130F; font-weight: 600; }
+.btn-accent:hover { opacity: 0.92; color: #16130F; border-color: var(--accent-soft); }
+.btn-danger { border-color: var(--bad); color: var(--bad); }
+.btn-danger:hover { background: var(--bad); color: #16130F; }
+.btn-sm { padding: 4px 9px; font-size: 12px; }
+.input {
+  border: 1px solid var(--line); background: var(--code-bg); color: #F2EDE4;
+  padding: 7px 10px; border-radius: 8px; font: 13px var(--font-mono); min-width: 220px;
+}
 .hero {
   background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
   box-shadow: var(--rim), var(--lift); padding: 22px 24px; margin-bottom: 22px;
@@ -98,6 +101,27 @@ header.top {
 .panel > .head h3 { margin: 0; font-size: 16px; }
 .panel > .head .meta { font: 12px var(--font-mono); color: var(--muted); }
 .panel > .body { padding: 18px; }
+.notice-box {
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px;
+  padding: 16px 18px; margin-bottom: 16px;
+}
+.key-reveal {
+  background: var(--code-bg); color: #F2EDE4; border: 1px solid var(--accent); border-radius: 10px;
+  padding: 16px 18px; margin-bottom: 18px;
+}
+.key-reveal .kr-title { color: var(--accent-soft); font: 600 13px var(--font-mono); margin-bottom: 8px; }
+.key-reveal .kr-val {
+  display: block; padding: 10px 12px; border-radius: 8px; background: #1B1712; border: 1px solid var(--line);
+  font: 600 13px var(--font-mono); word-break: break-all; color: var(--good); margin-bottom: 10px;
+}
+.row-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.badge {
+  display: inline-block; padding: 2px 8px; border-radius: 999px; font: 600 11px var(--font-mono);
+  border: 1px solid var(--line); background: var(--surface-2); color: var(--muted);
+}
+.badge-ok { border-color: var(--good); color: var(--good); }
+.badge-warn { border-color: var(--claimed); color: var(--claimed); }
+.badge-bad { border-color: var(--bad); color: var(--bad); }
 .jobs-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(275px, 1fr)); gap: 14px; }
 .job-card {
   background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; padding: 14px;
@@ -138,10 +162,27 @@ pre {
 }
 .cols-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 18px; }
 footer { margin-top: 34px; padding-top: 18px; border-top: 1px solid var(--line); color: var(--muted); font: 12.5px var(--font-mono); }
-</style>
+"""
+
+
+def render_index_html() -> str:
+    return (
+        """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>draft.bertholomus.com · GLM-5.3 Drafter Label Coordinator</title>
+<meta name="description" content="Trusted-contributor label coordinator for GLM-5.3 DSpine B=16 drafter training.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>"""
+        + COMMON_STYLE
+        + """</style>
 <script src="/static/app.js" defer></script>
 </head>
-<body>
+<body data-page="index">
 <div class="wrap">
   <header class="top">
     <div class="brand">
@@ -153,6 +194,7 @@ footer { margin-top: 34px; padding-top: 18px; border-top: 1px solid var(--line);
     </div>
     <div class="top-actions">
       <span class="pill"><span class="dot"></span><span id="statusText">Trusted Labels · Hardened</span></span>
+      <span id="authActions"><a class="btn btn-accent" href="/auth/login">Log in with GitHub</a></span>
       <button class="btn" id="refreshBtn" type="button">Refresh</button>
       <button class="btn" id="themeBtn" type="button">Theme</button>
     </div>
@@ -162,12 +204,11 @@ footer { margin-top: 34px; padding-top: 18px; border-top: 1px solid var(--line);
     <h2>Owner-Verified Label Coordination for GLM-5.3 DSpine</h2>
     <p>
       Modelled on <a href="https://quant.kindlingai.dev/" target="_blank" rel="noreferrer">Kindling AI's exlr8 quant site</a>
-      (jobs, slot grids, atomic claims, readiness gating, verified uploads, contributor credit), this coordinator
-      onboards trusted external contributors for <strong><code>drafter-label</code> slots only</strong> on
-      <code>kindlingai/glm-5.3-exlr8-k2-k3-k4@9e25c28a</code>. Every external label upload waits at
-      <code>uploaded</code> until an owner-side gate teacher-forces a secret HMAC-sampled set of
-      8&times;10 = 80 token probes against the reference GLM-5.3 lane. Training, evaluation, capture,
-      and packing slots remain owner-only.
+      (GitHub sign-in, self-service API keys, jobs, slot grids, atomic claims, readiness gating, verified uploads, contributor credit),
+      this coordinator onboards approved external contributors for <strong><code>drafter-label</code> slots only</strong> on
+      <code>kindlingai/glm-5.3-exlr8-k2-k3-k4@9e25c28a</code>. Sign in with GitHub to create, rotate, and revoke your own worker key;
+      every external label upload waits at <code>uploaded</code> until an owner-side gate teacher-forces 8&times;10 = 80 secret token probes
+      against the reference GLM-5.3 lane. Training, evaluation, capture, and packing slots remain owner-only.
     </p>
     <div class="hero-grid">
       <div class="stage-card">
@@ -194,10 +235,12 @@ footer { margin-top: 34px; padding-top: 18px; border-top: 1px solid var(--line);
   </section>
 
   <div class="tabs">
-    <button class="tab active" data-tab="board">Job Board &amp; Slot Grid</button>
-    <button class="tab" data-tab="matrix">Eval Matrix &amp; Rounds</button>
-    <button class="tab" data-tab="contributors">Contributors &amp; Audit</button>
-    <button class="tab" data-tab="api">API &amp; Label Worker</button>
+    <button class="tab active" data-tab="board" type="button">Job Board &amp; Slot Grid</button>
+    <button class="tab" data-tab="keys" type="button">API Keys</button>
+    <button class="tab" data-tab="admin" id="adminTabBtn" type="button" style="display:none">Admin · Access Requests</button>
+    <button class="tab" data-tab="matrix" type="button">Eval Matrix &amp; Rounds</button>
+    <button class="tab" data-tab="contributors" type="button">Contributors &amp; Audit</button>
+    <button class="tab" data-tab="api" type="button">API &amp; Label Worker</button>
   </div>
 
   <!-- TAB 1: JOB BOARD & SLOT GRID -->
@@ -227,6 +270,51 @@ footer { margin-top: 34px; padding-top: 18px; border-top: 1px solid var(--line);
           <span><i class="sw" style="background:var(--rejected)"></i>rejected</span>
         </div>
         <div class="slot-grid" id="slotGrid"></div>
+      </div>
+    </section>
+  </div>
+
+  <!-- TAB: SELF-SERVICE API KEYS -->
+  <div id="tab-keys" style="display:none">
+    <section class="panel">
+      <div class="head">
+        <h3>Self-Service Worker API Keys</h3>
+        <div class="meta" id="keysMeta">Sign in with GitHub to manage keys</div>
+      </div>
+      <div class="body">
+        <div id="keysAccountBar" class="notice-box">Loading session…</div>
+        <div id="keyRevealBox" class="key-reveal" style="display:none">
+          <div class="kr-title">New API key (shown once — save it now; it cannot be viewed again)</div>
+          <code class="kr-val" id="keyRevealValue"></code>
+          <div class="row-actions">
+            <button class="btn btn-accent btn-sm" id="copyKeyBtn" type="button">Copy key</button>
+            <button class="btn btn-sm" id="dismissKeyBtn" type="button">I saved it · Clear from screen</button>
+          </div>
+          <pre id="keySaveHint"></pre>
+        </div>
+        <div id="keysCreateBox" class="notice-box" style="display:none">
+          <div class="row-actions">
+            <input class="input" id="newKeyLabel" type="text" maxlength="64" placeholder="Key label (e.g. gr8-rig-1)">
+            <button class="btn btn-accent" id="createKeyBtn" type="button">Create API Key</button>
+            <span class="meta" id="keysCapHint"></span>
+          </div>
+        </div>
+        <div id="keysError" class="tag-bad" style="margin-bottom:10px;display:none"></div>
+        <div id="keysBody"></div>
+      </div>
+    </section>
+  </div>
+
+  <!-- TAB: OWNER ADMIN ACCESS REQUESTS -->
+  <div id="tab-admin" style="display:none">
+    <section class="panel">
+      <div class="head">
+        <h3>GitHub Access Requests &amp; Allow-List</h3>
+        <div class="meta" id="adminMeta">Owner only</div>
+      </div>
+      <div class="body">
+        <div id="adminError" class="tag-bad" style="margin-bottom:10px;display:none"></div>
+        <div id="adminBody">Loading…</div>
       </div>
     </section>
   </div>
@@ -281,6 +369,8 @@ footer { margin-top: 34px; padding-top: 18px; border-top: 1px solid var(--line);
         <table>
           <thead><tr><th>Endpoint</th><th>Method</th><th>Auth</th><th>Purpose</th></tr></thead>
           <tbody>
+            <tr><td><code>/auth/login</code> &rarr; <code>/auth/callback</code></td><td>GET</td><td>Browser</td><td>Log in with GitHub (read-only identity, allow-list gated)</td></tr>
+            <tr><td><code>/api/keys</code>, <code>.../rotate</code>, <code>DELETE /api/keys/&lt;id&gt;</code></td><td>GET/POST/DELETE</td><td>Session + CSRF</td><td>Self-service worker API keys (max 2 live keys, shown once)</td></tr>
             <tr><td><code>/api/jobs</code></td><td>GET</td><td>Public</td><td>List jobs, slot counts, verified totals, release info</td></tr>
             <tr><td><code>/api/grid?job=&lt;job&gt;&amp;offset=0&amp;limit=500</code></td><td>GET</td><td>Public (+optional Bearer)</td><td>Paginated slot grid, readiness gating, eval matrix, rounds</td></tr>
             <tr><td><code>/api/runners</code> (alias <code>/api/encoders</code>)</td><td>GET</td><td>Public</td><td>Accepted worker runner IDs &amp; container digests</td></tr>
@@ -292,16 +382,22 @@ footer { margin-top: 34px; padding-top: 18px; border-top: 1px solid var(--line);
             <tr><td><code>/api/artifacts/&lt;artifact_id&gt;</code></td><td>GET</td><td>Bearer key</td><td>Download input shards bound strictly to caller's active claim (<code>X-SHA256</code>)</td></tr>
             <tr><td><code>/api/uploads/direct/&lt;claim_id&gt;</code></td><td>POST</td><td>Bearer key</td><td>Direct upload (&le;12 MiB, mandatory <code>X-Content-SHA256</code>, isolated Phase-A verification)</td></tr>
             <tr><td><code>/api/uploads/init</code> &rarr; <code>PUT .../chunk/{i}</code> &rarr; <code>POST .../complete</code></td><td>POST/PUT</td><td>Bearer key</td><td>Chunked upload (&ge;256 KiB chunk floor, exact chunk sizes, mandatory SHA-256)</td></tr>
-            <tr><td><code>/api/admin/*</code></td><td>GET / POST</td><td>Admin Bearer</td><td>Operator credential for job/runner management &amp; owner verification verdicts</td></tr>
+            <tr><td><code>/api/admin/*</code></td><td>GET / POST</td><td>Admin Bearer</td><td>Operator credential for job/runner management, access approvals &amp; owner verification verdicts</td></tr>
           </tbody>
         </table>
-<pre># External label contributor quickstart (see LABELS.md for full spec)
-export DRAFT_API_KEY="$(cat ~/.config/draft-site/key)"
+<pre># 1. Click "Log in with GitHub" above, open the "API Keys" tab, and create a key.
+# 2. Save it with mode 0600:
+mkdir -p ~/.config/draft-site
+printf '%s\n' 'drs_wrk_PASTE_YOUR_KEY_HERE' &gt; ~/.config/draft-site/key
+chmod 600 ~/.config/draft-site/key
+
+# 3. Run one test slot first (see CONTRIBUTING.md and LABELS.md):
 python3 worker/label_worker.py \
   --url https://draft.bertholomus.com \
+  --key-file ~/.config/draft-site/key \
   --llm-endpoint http://127.0.0.1:8100 \
   --engine-tag kindling-gr8-bit280 \
-  --engine-image-digest sha256:&lt;engine-image-digest&gt; \
+  --engine-image-digest ghcr.io/kindlingai/gr8@sha256:&lt;digest&gt; \
   --engine-signature &lt;engine-build-or-signature&gt; \
   --quant-profile bit280 \
   --concurrency 4 \
@@ -324,3 +420,171 @@ python3 worker/label_worker.py \
 </body>
 </html>
 """
+    )
+
+
+def render_waiting_html(
+    *,
+    github_login: str,
+    github_name: str | None,
+    status: str,
+    csrf_token: str,
+) -> str:
+    esc_login = html.escape(github_login, quote=True)
+    esc_name = html.escape(github_name or "", quote=True)
+    esc_csrf = html.escape(csrf_token, quote=True)
+    name_part = f" ({esc_name})" if esc_name else ""
+    if status == "denied":
+        title = "Access denied"
+        msg = (
+            f"GitHub account <code>@{esc_login}</code>{name_part} is not approved to mint API keys "
+            "or claim slots on draft.bertholomus.com."
+        )
+    elif status == "quarantined":
+        title = "Account quarantined"
+        msg = (
+            f"GitHub account <code>@{esc_login}</code>{name_part} is currently quarantined. "
+            "Contact the site owner to review your account before minting keys or claiming slots."
+        )
+    else:
+        title = "Waiting for approval"
+        msg = (
+            f"Signed in with GitHub as <code>@{esc_login}</code>{name_part}. "
+            "Your access request is pending owner approval. Until approved, your account has no API keys "
+            "and cannot claim slots."
+        )
+    return (
+        """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>"""
+        + html.escape(title, quote=True)
+        + """ · draft.bertholomus.com</title>
+<style>"""
+        + COMMON_STYLE
+        + """</style>
+</head>
+<body>
+<div class="wrap" style="max-width:680px;padding-top:48px">
+  <section class="panel">
+    <div class="head">
+      <h3>"""
+        + html.escape(title, quote=True)
+        + """</h3>
+      <div class="meta">draft.bertholomus.com</div>
+    </div>
+    <div class="body">
+      <p>"""
+        + msg
+        + """</p>
+      <div class="row-actions" style="margin-top:18px">
+        <a class="btn" href="/">Back to status board</a>
+        <form method="post" action="/auth/logout" style="margin:0">
+          <input type="hidden" name="csrf_token" value=\""""
+        + esc_csrf
+        + """">
+          <button class="btn btn-danger" type="submit">Log out</button>
+        </form>
+      </div>
+    </div>
+  </section>
+</div>
+</body>
+</html>
+"""
+    )
+
+
+def render_admin_html() -> str:
+    return (
+        """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin · Access Requests · draft.bertholomus.com</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>"""
+        + COMMON_STYLE
+        + """</style>
+<script src="/static/app.js" defer></script>
+</head>
+<body data-page="admin">
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <div class="logo">DS</div>
+      <div>
+        <h1>draft.bertholomus.com · Admin</h1>
+        <div class="sub">Owner Allow-List &amp; Pending GitHub Requests</div>
+      </div>
+    </div>
+    <div class="top-actions">
+      <a class="btn" href="/">Status Board</a>
+      <span id="authActions"></span>
+      <button class="btn" id="refreshBtn" type="button">Refresh</button>
+      <button class="btn" id="themeBtn" type="button">Theme</button>
+    </div>
+  </header>
+
+  <section class="panel">
+    <div class="head">
+      <h3>GitHub Access Requests &amp; Allow-List</h3>
+      <div class="meta" id="adminMeta">Loading…</div>
+    </div>
+    <div class="body">
+      <div id="adminError" class="tag-bad" style="margin-bottom:10px;display:none"></div>
+      <div id="adminBody">Loading…</div>
+    </div>
+  </section>
+</div>
+</body>
+</html>
+"""
+    )
+
+
+def render_auth_error_html(title: str, message: str) -> str:
+    esc_title = html.escape(title, quote=True)
+    esc_msg = html.escape(message, quote=True)
+    return (
+        """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>"""
+        + esc_title
+        + """ · draft.bertholomus.com</title>
+<style>"""
+        + COMMON_STYLE
+        + """</style>
+</head>
+<body>
+<div class="wrap" style="max-width:680px;padding-top:48px">
+  <section class="panel">
+    <div class="head">
+      <h3>"""
+        + esc_title
+        + """</h3>
+      <div class="meta">draft.bertholomus.com</div>
+    </div>
+    <div class="body">
+      <p>"""
+        + esc_msg
+        + """</p>
+      <div class="row-actions" style="margin-top:18px">
+        <a class="btn btn-accent" href="/auth/login">Try Log in with GitHub again</a>
+        <a class="btn" href="/">Back to status board</a>
+      </div>
+    </div>
+  </section>
+</div>
+</body>
+</html>
+"""
+    )

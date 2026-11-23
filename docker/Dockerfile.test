@@ -1,4 +1,5 @@
-FROM local/draft-site:harden-candidate
+ARG BASE_IMAGE=local/draft-site:latest
+FROM ${BASE_IMAGE}
 
 USER root
 COPY requirements-dev.txt /app/requirements-dev.txt

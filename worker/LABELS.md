@@ -44,8 +44,11 @@ Each line of the uploaded `.labels.jsonl.gz` records:
 ```
 
 ## 3. Quick Start (2 Files, Stdlib Only for Mode A)
-Download `worker/client.py` and `worker/label_worker.py` (Python 3.10+; install `tokenizers` only if using Mode B). Store your issued single-line contributor key with mode `0600` (e.g. `~/.config/draft-site/key`), then run **1 canary slot first**:
+1. **Create your own worker API key:** Open https://draft.bertholomus.com, click **Log in with GitHub** (read-only identity; new accounts wait for owner approval), open the **API Keys** tab, and click **Create API Key** (full `drs_wrk_...` key is shown once; up to 2 live keys per account; rotate or revoke anytime).
+2. Download `worker/client.py` and `worker/label_worker.py` (Python 3.10+; install `tokenizers` only if using Mode B), save your key with mode `0600` at `~/.config/draft-site/key`, and run **1 canary slot first**:
 ```bash
+mkdir -p ~/.config/draft-site
+printf '%s\n' 'drs_wrk_PASTE_YOUR_KEY_HERE' > ~/.config/draft-site/key
 chmod 600 ~/.config/draft-site/key
 python3 worker/label_worker.py \
   --url https://draft.bertholomus.com \
@@ -65,5 +68,5 @@ Pass `--tokenizer-dir /path/to/glm53-tokenizer` only if your engine omits `token
 - **Owner-side teacher-forced gate:** Accepted uploads stay at `state="uploaded"` (`pending_label_gate`) until an owner gate probes an unguessable HMAC-sampled `8 prompts × 10 offsets = 80 tokens` on the reference GLM-5.3 lane.
   - **Per-slot pass bar:** `top1 >= 0.850` (`>=68/80`), `top5 >= 0.960` (`>=77/80`), and every sampled prompt `>= 0.50` (`>=5/10`).
   - **New-engine canary bar:** `top1 >= 0.920` and `top5 >= 0.990` on the first 200-prompt shard before bulk runs.
-- **Account controls:** Non-owner accounts may claim `drafter-label` only, hold at most **2 active claims**, download only input shards bound to their active claims, and are **auto-quarantined at 3 strikes**.
+- **Account controls:** Non-owner accounts may claim `drafter-label` only, hold at most **2 active claims**, hold up to **2 live API keys** (self-service create/rotate/revoke via GitHub login), download only input shards bound to their active claims, and are **auto-quarantined at 3 strikes**.
 - **Training note:** External labels are ingested downstream with teacher-forced target relabeling and prefix masking (`L2`/`L4` regime) so minor cross-engine greedy drift does not harm drafter quality.

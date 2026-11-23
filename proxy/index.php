@@ -64,30 +64,51 @@ $passHeaderMap = [
     'HTTP_X_ARTIFACT_TYPE' => 'X-Artifact-Type',
     'HTTP_X_MANIFEST_JSON' => 'X-Manifest-JSON',
     'HTTP_X_REQUEST_ID' => 'X-Request-ID',
+    'HTTP_X_CSRF_TOKEN' => 'X-CSRF-Token',
+    'HTTP_COOKIE' => 'Cookie',
+    'HTTP_ORIGIN' => 'Origin',
+    'HTTP_REFERER' => 'Referer',
+    'HTTP_USER_AGENT' => 'User-Agent',
     'HTTP_ACCEPT' => 'Accept',
     'HTTP_RANGE' => 'Range',
     'HTTP_IF_NONE_MATCH' => 'If-None-Match',
     'CONTENT_TYPE' => 'Content-Type',
 ];
+$forwardedLower = [];
 foreach ($passHeaderMap as $serverKey => $headerName) {
-    if (!empty($_SERVER[$serverKey])) {
+    if (isset($_SERVER[$serverKey]) && $_SERVER[$serverKey] !== '') {
         $val = str_replace(["\r", "\n"], '', (string)$_SERVER[$serverKey]);
         $forwardHeaders[] = $headerName . ': ' . $val;
+        $forwardedLower[strtolower($headerName)] = true;
     }
 }
 
 $auth = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '';
-if ($auth === '' && function_exists('getallheaders')) {
-    foreach (getallheaders() as $k => $v) {
-        if (strcasecmp((string)$k, 'Authorization') === 0) {
-            $auth = (string)$v;
-            break;
+if ($auth !== '') {
+    $auth = str_replace(["\r", "\n"], '', (string)$auth);
+    $forwardHeaders[] = 'Authorization: ' . $auth;
+    $forwardedLower['authorization'] = true;
+}
+
+if (function_exists('getallheaders')) {
+    $allHeaders = getallheaders();
+    if (is_array($allHeaders)) {
+        $fallbackTargets = [
+            'authorization' => 'Authorization',
+            'cookie' => 'Cookie',
+            'x-csrf-token' => 'X-CSRF-Token',
+        ];
+        foreach ($allHeaders as $k => $v) {
+            $lk = strtolower((string)$k);
+            if (isset($fallbackTargets[$lk]) && empty($forwardedLower[$lk])) {
+                $val = str_replace(["\r", "\n"], '', (string)$v);
+                if ($val !== '') {
+                    $forwardHeaders[] = $fallbackTargets[$lk] . ': ' . $val;
+                    $forwardedLower[$lk] = true;
+                }
+            }
         }
     }
-}
-if ($auth !== '') {
-    $auth = str_replace(["\r", "\n"], '', $auth);
-    $forwardHeaders[] = 'Authorization: ' . $auth;
 }
 
 $ch = curl_init($targetUrl);
@@ -182,7 +203,7 @@ curl_setopt($ch, CURLOPT_HEADERFUNCTION, static function ($ch, string $line) use
         $name = trim(substr($trimmed, 0, $colon));
         $lower = strtolower($name);
         if (!isset($hopByHop[$lower])) {
-            header($name . ': ' . trim(substr($trimmed, $colon + 1)), false);
+            header($name . ': ' . trim(substr($trimmed, $colon + 1)), false, $statusCode);
             $headersSent = true;
         }
     }

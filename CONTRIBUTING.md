@@ -32,17 +32,22 @@ Current bulk job: `glm53-dspine-labels-prod`, 386 pieces ("slots") of 200 prompt
 | The right weights | `zai-org/GLM-5.3`. Recommended: `kindlingai/glm-5.3-exlr8-k2-k3-k4` at commit `9e25c28a2e8808d8b2599d780521fd6af24e7558`, profile `bit280`. BF16, FP8 and other exlr8 profiles (`bit200`..`bit400`) are eligible but must pass the new-engine check (section 7). |
 | Python | 3.10 or newer. The worker uses only the standard library, unless you need text mode (then `pip install tokenizers`). |
 | Two files from this repo | `worker/label_worker.py` and `worker/client.py`. Nothing else in the repo is needed to contribute. |
-| A contributor key | One line, starts with `drs_wrk_`. Albert sends it to you privately. It can **only** submit labels. |
+| A GitHub account + self-service worker key | Click **Log in with GitHub** at https://draft.bertholomus.com, open the **API Keys** tab, and create your own worker key (`drs_wrk_...`, shown once; up to 2 live keys per account; you can rotate or revoke it yourself at any time). First-time GitHub accounts wait for owner approval; pre-approved contributors can create keys immediately. External keys can **only** submit labels. |
 | Network | Outbound HTTPS to `draft.bertholomus.com`. Your GLM-5.3 server never needs to be reachable from the internet; the worker talks to it locally. |
 
 ## 3. One-time setup
+
+1. Open https://draft.bertholomus.com and click **Log in with GitHub**.
+   - If your GitHub account is already approved, open the **API Keys** tab, click **Create API Key**, and copy the full `drs_wrk_...` key (it is shown only once; after that the panel shows only the prefix, created time, and last-used time).
+   - If you are new, you will see a "Waiting for approval" page until the site owner approves your GitHub account; once approved, return to the **API Keys** tab to create a key.
+2. Clone the repo and save your key to `~/.config/draft-site/key` with mode `0600`:
 
 ```bash
 # 1. Get the worker (repo access comes with your GitHub invite)
 git clone https://github.com/bertholomus/draft-site.git
 cd draft-site
 
-# 2. Store your key. One line, nothing else, readable only by you.
+# 2. Store the key you created in the API Keys panel. One line, nothing else, readable only by you.
 mkdir -p ~/.config/draft-site
 printf '%s\n' 'drs_wrk_PASTE_YOUR_KEY_HERE' > ~/.config/draft-site/key
 chmod 600 ~/.config/draft-site/key
@@ -178,15 +183,15 @@ WantedBy=default.target
   test slot after any engine, quant or config change to avoid strikes.
 - Don't edit the worker to change prompts, sampling or token handling. Greedy decoding (`temperature 0`,
   `top_p 1`) is required.
-- Keep your key private. If it leaks, tell Albert; the key can be replaced in one step and the old one stops
-  working at once.
+- Keep your key private. You can have up to **2 live keys** per account; if a key leaks, open the **API Keys**
+  panel at https://draft.bertholomus.com and click **Rotate** or **Revoke**—the old key stops working at once.
 
 ## 10. Troubleshooting
 
 | You see | Meaning | Fix |
 |---|---|---|
 | `API key required via --key-file or DRAFT_API_KEY` | No key found | Check `--key-file` path, or `export DRAFT_API_KEY=...` |
-| `Claim error (HTTP 401)` / `(HTTP 403)` and exit | Key wrong, revoked, or account quarantined | Run the `/api/me` check; contact Albert |
+| `Claim error (HTTP 401)` / `(HTTP 403)` and exit | Key wrong, revoked, or account quarantined | Run the `/api/me` check; if revoked, create a new key in the **API Keys** panel at the site; if quarantined, contact Albert |
 | `missing required header X-Quant: 1` | Calling the API by hand without the header | Add `-H "X-Quant: 1"` |
 | `No open slots on ...; sleeping` | All slots are claimed or done | Nothing to do; it retries |
 | Preflight fails / no `token_ids` | Your engine doesn't return token ids | Use text mode (section 5.3) or turn on `return_token_ids` in your engine |

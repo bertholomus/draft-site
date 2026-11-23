@@ -12,9 +12,10 @@ slots on job `glm53-dspine-labels-prod`, generates greedy labels, uploads them, 
 
 ## Hard rules (do not break)
 
-1. **Protect the contributor key** (`drs_wrk_...`). The human may hand it to you directly; that is expected.
-   Save it at once to `~/.config/draft-site/key` with mode `0600` (step 1) and from then on read it only from
-   that file. Never print it back, log it, commit it, or put it in an issue or a message.
+1. **Protect the contributor key** (`drs_wrk_...`). The human creates the key in the **API Keys** panel at
+   https://draft.bertholomus.com (after clicking **Log in with GitHub**) and hands it to you directly; that is
+   expected. Save it at once to `~/.config/draft-site/key` with mode `0600` (step 1) and from then on read it
+   only from that file. Never print it back, log it, commit it, or put it in an issue or a message.
 2. **Do not modify** `worker/label_worker.py` or `worker/client.py` logic: not prompts, sampling, token
    handling, retry, or upload code. Greedy decoding is required (`temperature 0.0`, `top_p 1.0`). Changing it
    produces rejected uploads and strikes.
@@ -32,6 +33,7 @@ slots on job `glm53-dspine-labels-prod`, generates greedy labels, uploads them, 
 | Item | Value |
 |---|---|
 | Site | `https://draft.bertholomus.com` |
+| Keys | Human logs in with GitHub at the site -> **API Keys** tab -> creates a `drs_wrk_...` key (shown once, max 2 live keys, self-service rotate/revoke) |
 | Job | `glm53-dspine-labels-prod` (worker default) |
 | Runner id | `drs-label-ext-v1.0.0` (worker default) |
 | Model | `zai-org/GLM-5.3`, vocab 154,880 |
@@ -46,10 +48,12 @@ slots on job `glm53-dspine-labels-prod`, generates greedy labels, uploads them, 
 
 ## What "just give it the key" means
 
-With the key and a running GLM-5.3 server, you can do everything else yourself: save the key, check the
-account, detect the model id and token-id support, read the engine digest from Docker, run the test slot,
-watch verification, and start the continuous run. Ask the human only for what you cannot detect: the server
-URL if it is not `http://127.0.0.1:8100`, and the engine build commit if Docker labels don't show it.
+The human logs in with GitHub at https://draft.bertholomus.com, creates a key in the **API Keys** panel, and
+hands it to you. With that key and a running GLM-5.3 server, you do everything else yourself: save the key
+(`0600`), check the account, detect the model id and token-id support, read the engine digest from Docker, run
+the test slot, watch verification, and start the continuous run. Ask the human only for what you cannot detect:
+the key if `~/.config/draft-site/key` is missing, the server URL if it is not `http://127.0.0.1:8100`, and the
+engine build commit if Docker labels don't show it.
 
 ## Procedure
 
@@ -62,8 +66,9 @@ LLM=http://127.0.0.1:8100                           # ask the human if their ser
 curl -sf $LLM/v1/models                             # must list a GLM-5.3 model id
 ```
 
-If the key file is missing, ask the human for the key (or take it from their message) and save it yourself
-without echoing it:
+If the key file is missing, ask the human to log in with GitHub at https://draft.bertholomus.com, create a key
+in the **API Keys** panel, and hand it to you (or take it from their message), then save it yourself without
+echoing it:
 
 ```bash
 mkdir -p ~/.config/draft-site
@@ -145,7 +150,7 @@ Same command without `--max-slots 1`. Prefer a supervised service (see CONTRIBUT
 | Output | Action |
 |---|---|
 | `API key required via --key-file or DRAFT_API_KEY` | Fix key path; key file must exist |
-| `Claim error (HTTP 401)` / `(HTTP 403)` then exit | Stop. Key invalid/revoked or quarantined. Tell the human to contact Albert |
+| `Claim error (HTTP 401)` / `(HTTP 403)` then exit | Stop. Key invalid/revoked or quarantined. Ask the human to check the **API Keys** panel at https://draft.bertholomus.com (rotate/create key) or contact Albert if quarantined |
 | `No open slots on ...; sleeping Ns...` | Normal. Leave it running |
 | `requested slot ... not open` | Drop `--slot`; let the worker pick |
 | `non-retryable HTTP 4xx on prompt ...` | Server rejected a request (often context length). Server must allow prompt + 1,536 tokens |

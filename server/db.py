@@ -1,4 +1,4 @@
-"""SQLite state store for jobs, slots, claims, uploads, verifications, rounds, and audit logs.
+"""SQLite state store for jobs, slots, claims, uploads, verifications, rounds, sessions, API keys, and audit logs.
 
 Uses journal_mode=DELETE (low-QPS coordinator; avoids -wal/-shm sidecar UID issues) and
 separates read-only queries (db.ro()) from immediate write transactions (db.tx(immediate=True)).
@@ -8,6 +8,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
+import secrets
 import shutil
 import sqlite3
 import time
@@ -16,6 +18,10 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from server import config
+
+HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+SAFE_LOGIN_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
+RESERVED_LOGINS = frozenset(("admin", "system", "owner", "root", "anonymous", "unknown"))
 
 
 def utc_ms() -> int:
@@ -30,6 +36,26 @@ def utc_iso(ts_ms: int | None = None) -> str:
 def hash_api_key(raw_key: str) -> str:
     """Deterministic SHA-256 with domain separation (keys are 256-bit random tokens)."""
     return hashlib.sha256(("drs-v1:" + raw_key).encode("utf-8")).hexdigest()
+
+
+def hmac_token(purpose: str, value: str) -> str:
+    """Keyed HMAC-SHA256 for storing session IDs and OAuth state/nonces at rest."""
+    key = config.load_session_secret()
+    return hmac.new(key, f"drs-v1:{purpose}:{value}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def key_prefix(raw_key: str) -> str:
+    """Return safe display prefix (e.g. drs_wrk_Ab12Cd) exposing at most 6 random chars."""
+    return raw_key[:14]
+
+
+def no_key_sentinel() -> str:
+    """Non-matching unique placeholder for contributors.key_hash when account has no legacy key."""
+    return "none:" + secrets.token_hex(16)
+
+
+def is_real_key_hash(val: str | None) -> bool:
+    return bool(val and HEX64_RE.match(val))
 
 
 def ensure_dirs() -> None:
@@ -95,13 +121,53 @@ CREATE TABLE IF NOT EXISTS contributors (
     is_admin INTEGER NOT NULL DEFAULT 0,
     is_owner INTEGER NOT NULL DEFAULT 0,
     approved INTEGER NOT NULL DEFAULT 1,
+    denied INTEGER NOT NULL DEFAULT 0,
     tiers_json TEXT NOT NULL DEFAULT '[]',
     strikes INTEGER NOT NULL DEFAULT 0,
     quarantined INTEGER NOT NULL DEFAULT 0,
     note TEXT,
+    github_id INTEGER,
+    github_login TEXT,
+    github_name TEXT,
     created_at INTEGER NOT NULL,
     last_seen_at INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS api_keys (
+    key_id TEXT PRIMARY KEY,
+    contributor_login TEXT NOT NULL REFERENCES contributors(login) ON DELETE CASCADE,
+    key_hash TEXT NOT NULL UNIQUE,
+    key_prefix TEXT NOT NULL,
+    label TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    last_used_at INTEGER,
+    revoked_at INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_keys_login ON api_keys(contributor_login, revoked_at);
+CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    session_hash TEXT PRIMARY KEY,
+    contributor_login TEXT NOT NULL REFERENCES contributors(login) ON DELETE CASCADE,
+    csrf_token TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_login ON sessions(contributor_login);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
+CREATE TABLE IF NOT EXISTS oauth_states (
+    state_hash TEXT PRIMARY KEY,
+    nonce_hash TEXT NOT NULL,
+    return_to TEXT NOT NULL DEFAULT '/',
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_oauth_states_expires ON oauth_states(expires_at);
 
 CREATE TABLE IF NOT EXISTS runners (
     commit_id TEXT PRIMARY KEY,
@@ -231,12 +297,25 @@ def init_db() -> None:
     c0 = connect(set_journal=True)
     try:
         c0.executescript(SCHEMA_SQL)
-        # Idempotent migration for existing DBs lacking contributors.is_owner
+        # Idempotent additive migrations for existing DBs
         cols = {r["name"] for r in c0.execute("PRAGMA table_info(contributors)").fetchall()}
         if "is_owner" not in cols:
             c0.execute("ALTER TABLE contributors ADD COLUMN is_owner INTEGER NOT NULL DEFAULT 0;")
+        if "denied" not in cols:
+            c0.execute("ALTER TABLE contributors ADD COLUMN denied INTEGER NOT NULL DEFAULT 0;")
+        if "github_id" not in cols:
+            c0.execute("ALTER TABLE contributors ADD COLUMN github_id INTEGER;")
+        if "github_login" not in cols:
+            c0.execute("ALTER TABLE contributors ADD COLUMN github_login TEXT;")
+        if "github_name" not in cols:
+            c0.execute("ALTER TABLE contributors ADD COLUMN github_name TEXT;")
+        c0.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_contributors_github_id "
+            "ON contributors(github_id) WHERE github_id IS NOT NULL;"
+        )
     finally:
         c0.close()
+
     with tx(immediate=True) as conn:
         now = utc_ms()
         # Bootstrap admin credential from mounted read-only secret file (separate from contributors)
@@ -244,9 +323,9 @@ def init_db() -> None:
         if admin_key:
             kh = hash_api_key(admin_key)
             conn.execute(
-                """INSERT INTO contributors (login, key_hash, is_admin, is_owner, approved, tiers_json, note, created_at)
-                   VALUES ('admin', ?, 1, 1, 1, '["admin"]', 'Bootstrap site operator', ?)
-                   ON CONFLICT(login) DO UPDATE SET key_hash=excluded.key_hash, is_admin=1, is_owner=1, approved=1""",
+                """INSERT INTO contributors (login, key_hash, is_admin, is_owner, approved, denied, tiers_json, note, created_at)
+                   VALUES ('admin', ?, 1, 1, 1, 0, '["admin"]', 'Bootstrap site operator', ?)
+                   ON CONFLICT(login) DO UPDATE SET key_hash=excluded.key_hash, is_admin=1, is_owner=1, approved=1, denied=0""",
                 (kh, now),
             )
         # Ensure existing owner logins and admins carry is_owner=1
@@ -265,11 +344,63 @@ def init_db() -> None:
             is_own = 1 if login in config.OWNER_LOGINS else 0
             tiers = json.dumps(["tier-label"])
             conn.execute(
-                """INSERT INTO contributors (login, key_hash, is_admin, is_owner, approved, tiers_json, note, created_at)
-                   VALUES (?, ?, 0, ?, 1, ?, 'Bootstrapped worker', ?)
+                """INSERT INTO contributors (login, key_hash, is_admin, is_owner, approved, denied, tiers_json, note, created_at)
+                   VALUES (?, ?, 0, ?, 1, 0, ?, 'Bootstrapped worker', ?)
                    ON CONFLICT(login) DO NOTHING""",
                 (login, kh, is_own, tiers, now),
             )
+
+        # Idempotent migration of existing contributor key_hash rows into api_keys (preserves all existing keys!)
+        existing_contribs = conn.execute(
+            "SELECT login, key_hash, created_at, last_seen_at FROM contributors WHERE is_admin=0"
+        ).fetchall()
+        for row in existing_contribs:
+            kh = str(row["key_hash"] or "")
+            if not is_real_key_hash(kh):
+                continue
+            already = conn.execute("SELECT 1 FROM api_keys WHERE key_hash=?", (kh,)).fetchone()
+            if already is None:
+                kid = "key_" + secrets.token_hex(8)
+                conn.execute(
+                    """INSERT INTO api_keys (key_id, contributor_login, key_hash, key_prefix, label, created_at, last_used_at, revoked_at)
+                       VALUES (?, ?, ?, 'drs_wrk_legacy', 'Initial key', ?, ?, NULL)""",
+                    (kid, row["login"], kh, int(row["created_at"] or now), row["last_seen_at"]),
+                )
+
+        # Seed/bind pre-approved GitHub accounts (owner bertholomus + existing outside rows)
+        for gh_login, spec in config.PREAPPROVED_GITHUB_ACCOUNTS.items():
+            site_login = str(spec["site_login"])
+            gh_id = spec.get("github_id")
+            if gh_id is not None:
+                bound = conn.execute("SELECT login FROM contributors WHERE github_id=?", (int(gh_id),)).fetchone()
+                if bound is not None:
+                    continue
+            existing = conn.execute("SELECT * FROM contributors WHERE login=?", (site_login,)).fetchone()
+            if existing is not None:
+                if existing["github_id"] is None and gh_id is not None:
+                    conn.execute(
+                        "UPDATE contributors SET github_id=?, github_login=? WHERE login=? AND github_id IS NULL",
+                        (int(gh_id), gh_login, site_login),
+                    )
+                if spec.get("is_owner") and not existing["is_owner"]:
+                    conn.execute("UPDATE contributors SET is_owner=1 WHERE login=?", (site_login,))
+            elif spec.get("is_owner"):
+                # Seed the owner GitHub account (no worker key minted automatically)
+                conn.execute(
+                    """INSERT INTO contributors
+                       (login, key_hash, is_admin, is_owner, approved, denied, tiers_json, strikes, quarantined, note, github_id, github_login, created_at)
+                       VALUES (?, ?, 0, 1, 1, 0, ?, 0, 0, ?, ?, ?, ?)""",
+                    (
+                        site_login,
+                        no_key_sentinel(),
+                        json.dumps(spec.get("tiers") or ["tier-label"]),
+                        spec.get("note") or "Owner account (GitHub)",
+                        int(gh_id) if gh_id is not None else None,
+                        gh_login,
+                        now,
+                    ),
+                )
+
         sweep_expired_claims(conn)
 
 
@@ -287,6 +418,13 @@ def log_audit(
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
         (utc_ms(), actor, action, job, slot_id, status, json.dumps(detail or {}, sort_keys=True)),
     )
+
+
+def sweep_expired_sessions(conn: sqlite3.Connection) -> int:
+    now = utc_ms()
+    c1 = conn.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
+    c2 = conn.execute("DELETE FROM oauth_states WHERE expires_at < ?", (now,))
+    return int((c1.rowcount or 0) + (c2.rowcount or 0))
 
 
 def sweep_expired_uploads(conn: sqlite3.Connection) -> int:
@@ -307,7 +445,6 @@ def sweep_expired_uploads(conn: sqlite3.Connection) -> int:
         claim_dead = (r["slot_state"] != "claimed") or (r["slot_claim"] != r["claim_id"])
         is_expired = (int(r["expires_at"]) < now) or claim_dead
         if r["state"] == "verifying":
-            # Only sweep a 'verifying' session if it is well past the verifier timeout
             is_expired = is_expired and (int(r["created_at"]) < verify_stale_cutoff)
         if is_expired:
             conn.execute("UPDATE upload_sessions SET state='expired' WHERE upload_id=?", (uid,))
@@ -320,7 +457,6 @@ def sweep_expired_uploads(conn: sqlite3.Connection) -> int:
         else:
             active_ids.add(uid)
 
-    # Sweep orphaned staging files/directories not tied to any active upload session
     if config.STAGING_DIR.is_dir():
         cutoff_sec = time.time() - config.STAGING_ORPHAN_TTL_SEC
         for child in list(config.STAGING_DIR.iterdir()):
@@ -354,6 +490,7 @@ def sweep_expired_claims(conn: sqlite3.Connection) -> int:
         )
         log_audit(conn, "system", "claim_expired", "ok", r["job"], r["slot_id"], {"prev_holder": r["claimed_by"]})
     sweep_expired_uploads(conn)
+    sweep_expired_sessions(conn)
     return len(rows)
 
 
@@ -366,15 +503,394 @@ def lookup_auth(
     if not raw_token:
         return None
     kh = hash_api_key(raw_token)
-    row = conn.execute("SELECT * FROM contributors WHERE key_hash=?", (kh,)).fetchone()
-    if row is not None and hmac.compare_digest(row["key_hash"], kh):
+    # 1. Bootstrap admin credential (strictly separate from contributor api_keys)
+    admin_row = conn.execute(
+        "SELECT *, NULL AS auth_key_id, NULL AS auth_key_last_used_at FROM contributors WHERE is_admin=1 AND key_hash=?",
+        (kh,),
+    ).fetchone()
+    if admin_row is not None and hmac.compare_digest(admin_row["key_hash"], kh):
         if touch_last_seen:
             now = utc_ms()
-            prev = row["last_seen_at"]
+            prev = admin_row["last_seen_at"]
             if prev is None or (now - int(prev)) >= 60_000:
+                conn.execute("UPDATE contributors SET last_seen_at=? WHERE login=?", (now, admin_row["login"]))
+        return admin_row
+
+    # 2. Contributor worker key in api_keys (revoked keys rejected immediately)
+    row = conn.execute(
+        """SELECT c.*, k.key_id AS auth_key_id, k.key_hash AS auth_key_hash, k.last_used_at AS auth_key_last_used_at
+           FROM api_keys k
+           JOIN contributors c ON k.contributor_login = c.login
+           WHERE k.key_hash=? AND k.revoked_at IS NULL""",
+        (kh,),
+    ).fetchone()
+    if row is not None and hmac.compare_digest(row["auth_key_hash"], kh):
+        if touch_last_seen:
+            now = utc_ms()
+            prev_u = row["last_seen_at"]
+            if prev_u is None or (now - int(prev_u)) >= 60_000:
                 conn.execute("UPDATE contributors SET last_seen_at=? WHERE login=?", (now, row["login"]))
+            prev_k = row["auth_key_last_used_at"]
+            if prev_k is None or (now - int(prev_k)) >= 60_000:
+                conn.execute("UPDATE api_keys SET last_used_at=? WHERE key_id=?", (now, row["auth_key_id"]))
         return row
     return None
+
+
+def touch_key_usage_if_stale(key_id: str | None, login: str, last_used_at: int | None) -> None:
+    """Update api_keys.last_used_at and contributors.last_seen_at when null or >= 60s old."""
+    if not key_id:
+        return
+    now = utc_ms()
+    if last_used_at is not None and (now - int(last_used_at)) < 60_000:
+        return
+    try:
+        with tx(immediate=True) as conn:
+            conn.execute("UPDATE api_keys SET last_used_at=? WHERE key_id=? AND revoked_at IS NULL", (now, key_id))
+            conn.execute("UPDATE contributors SET last_seen_at=? WHERE login=?", (now, login))
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# OAuth State & Server-Side Session Store
+# ---------------------------------------------------------------------------
+
+def create_oauth_state(conn: sqlite3.Connection, state: str, browser_nonce: str, return_to: str) -> None:
+    now = utc_ms()
+    sweep_expired_sessions(conn)
+    conn.execute(
+        """INSERT INTO oauth_states (state_hash, nonce_hash, return_to, created_at, expires_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (
+            hmac_token("oauth_state", state),
+            hmac_token("oauth_nonce", browser_nonce),
+            return_to,
+            now,
+            now + config.OAUTH_STATE_TTL_SEC * 1000,
+        ),
+    )
+
+
+def consume_oauth_state(conn: sqlite3.Connection, state: str, browser_nonce: str) -> str | None:
+    """Atomically verify and delete a single-use OAuth state bound to the browser nonce."""
+    if not state or not browser_nonce:
+        return None
+    now = utc_ms()
+    sweep_expired_sessions(conn)
+    sh = hmac_token("oauth_state", state)
+    row = conn.execute("SELECT * FROM oauth_states WHERE state_hash=?", (sh,)).fetchone()
+    if row is None:
+        return None
+    # Burn immediately so state can NEVER be replayed even if nonce check fails
+    conn.execute("DELETE FROM oauth_states WHERE state_hash=?", (sh,))
+    if int(row["expires_at"]) < now:
+        return None
+    expected_nh = hmac_token("oauth_nonce", browser_nonce)
+    if not hmac.compare_digest(str(row["nonce_hash"]), expected_nh):
+        return None
+    return str(row["return_to"] or "/")
+
+
+def create_session(
+    conn: sqlite3.Connection,
+    contributor_login: str,
+    *,
+    old_session_token: str | None = None,
+) -> tuple[str, str]:
+    """Create a fresh rotated server-side session (deleting any prior session to block fixation)."""
+    if old_session_token:
+        old_hash = hmac_token("session", old_session_token)
+        conn.execute("DELETE FROM sessions WHERE session_hash=?", (old_hash,))
+    now = utc_ms()
+    session_id = secrets.token_urlsafe(32)
+    csrf_token = secrets.token_urlsafe(32)
+    sh = hmac_token("session", session_id)
+    expires_at = now + config.SESSION_IDLE_TTL_SEC * 1000
+    conn.execute(
+        """INSERT INTO sessions (session_hash, contributor_login, csrf_token, created_at, last_seen_at, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (sh, contributor_login, csrf_token, now, now, expires_at),
+    )
+    return session_id, csrf_token
+
+
+def lookup_session(
+    conn: sqlite3.Connection,
+    session_token: str | None,
+    *,
+    touch: bool = False,
+) -> sqlite3.Row | None:
+    if not session_token:
+        return None
+    sh = hmac_token("session", session_token)
+    row = conn.execute(
+        """SELECT s.session_hash, s.csrf_token, s.created_at AS session_created_at,
+                  s.last_seen_at AS session_last_seen_at, s.expires_at AS session_expires_at,
+                  c.*
+           FROM sessions s
+           JOIN contributors c ON s.contributor_login = c.login
+           WHERE s.session_hash=?""",
+        (sh,),
+    ).fetchone()
+    if row is None or not hmac.compare_digest(str(row["session_hash"]), sh):
+        return None
+    now = utc_ms()
+    if int(row["session_expires_at"]) < now:
+        return None
+    if touch:
+        prev = int(row["session_last_seen_at"])
+        if (now - prev) >= 300_000:
+            conn.execute(
+                "UPDATE sessions SET last_seen_at=?, expires_at=? WHERE session_hash=?",
+                (now, now + config.SESSION_IDLE_TTL_SEC * 1000, sh),
+            )
+    return row
+
+
+def touch_session_if_stale(session_hash: str, session_last_seen_at: int) -> None:
+    now = utc_ms()
+    if (now - int(session_last_seen_at)) < 300_000:
+        return
+    try:
+        with tx(immediate=True) as conn:
+            conn.execute(
+                "UPDATE sessions SET last_seen_at=?, expires_at=? WHERE session_hash=?",
+                (now, now + config.SESSION_IDLE_TTL_SEC * 1000, session_hash),
+            )
+    except Exception:
+        pass
+
+
+def delete_session(conn: sqlite3.Connection, session_token: str | None) -> bool:
+    if not session_token:
+        return False
+    sh = hmac_token("session", session_token)
+    cur = conn.execute("DELETE FROM sessions WHERE session_hash=?", (sh,))
+    return bool(cur.rowcount)
+
+
+def delete_user_sessions(conn: sqlite3.Connection, contributor_login: str) -> int:
+    cur = conn.execute("DELETE FROM sessions WHERE contributor_login=?", (contributor_login,))
+    return int(cur.rowcount or 0)
+
+
+# ---------------------------------------------------------------------------
+# GitHub Account Resolution & Self-Service API Keys
+# ---------------------------------------------------------------------------
+
+def resolve_or_create_github_contributor(
+    conn: sqlite3.Connection,
+    *,
+    github_id: int,
+    github_login: str,
+    github_name: str | None = None,
+) -> tuple[sqlite3.Row, bool]:
+    """Key account strictly on GitHub numeric user id; update display login; map pre-approved rows."""
+    now = utc_ms()
+    gh_login = github_login.strip()[:100]
+    gh_name = (github_name or "").strip()[:128] or None
+
+    # 1. Existing contributor keyed by GitHub numeric user id (survives GitHub username renames!)
+    existing = conn.execute("SELECT * FROM contributors WHERE github_id=?", (github_id,)).fetchone()
+    if existing is not None:
+        conn.execute(
+            "UPDATE contributors SET github_login=?, github_name=?, last_seen_at=? WHERE login=?",
+            (gh_login, gh_name, now, existing["login"]),
+        )
+        return conn.execute("SELECT * FROM contributors WHERE login=?", (existing["login"],)).fetchone(), False
+
+    # 2. Match pre-approved mapping (strictly by numeric github_id if configured; login match ONLY if id is unset)
+    matched_spec: dict[str, Any] | None = None
+    for spec_login, spec in config.PREAPPROVED_GITHUB_ACCOUNTS.items():
+        spec_gid = spec.get("github_id")
+        if spec_gid is not None:
+            if int(spec_gid) == github_id:
+                matched_spec = spec
+                break
+        elif spec_login.lower() == gh_login.lower():
+            matched_spec = spec
+            break
+
+    if matched_spec is not None:
+        site_login = str(matched_spec["site_login"])
+        row_by_login = conn.execute("SELECT * FROM contributors WHERE login=?", (site_login,)).fetchone()
+        if row_by_login is not None and row_by_login["github_id"] is None:
+            conn.execute(
+                "UPDATE contributors SET github_id=?, github_login=?, github_name=?, last_seen_at=? WHERE login=?",
+                (github_id, gh_login, gh_name, now, site_login),
+            )
+            return conn.execute("SELECT * FROM contributors WHERE login=?", (site_login,)).fetchone(), False
+        if row_by_login is None:
+            is_own = 1 if matched_spec.get("is_owner") else 0
+            tiers = json.dumps(matched_spec.get("tiers") or ["tier-label"])
+            conn.execute(
+                """INSERT INTO contributors
+                   (login, key_hash, is_admin, is_owner, approved, denied, tiers_json, strikes, quarantined, note, github_id, github_login, github_name, created_at, last_seen_at)
+                   VALUES (?, ?, 0, ?, 1, 0, ?, 0, 0, ?, ?, ?, ?, ?, ?)""",
+                (
+                    site_login,
+                    no_key_sentinel(),
+                    is_own,
+                    tiers,
+                    matched_spec.get("note") or "Pre-approved GitHub contributor",
+                    github_id,
+                    gh_login,
+                    gh_name,
+                    now,
+                    now,
+                ),
+            )
+            return conn.execute("SELECT * FROM contributors WHERE login=?", (site_login,)).fetchone(), False
+
+    # 3. Unknown GitHub user -> pending request (approved=0, denied=0, no key, no claims)
+    candidate = gh_login if (SAFE_LOGIN_RE.match(gh_login) and gh_login.lower() not in RESERVED_LOGINS) else f"gh_{github_id}"
+    if conn.execute("SELECT 1 FROM contributors WHERE login=?", (candidate,)).fetchone() is not None:
+        candidate = f"gh_{github_id}"
+    conn.execute(
+        """INSERT INTO contributors
+           (login, key_hash, is_admin, is_owner, approved, denied, tiers_json, strikes, quarantined, note, github_id, github_login, github_name, created_at, last_seen_at)
+           VALUES (?, ?, 0, 0, 0, 0, '["tier-label"]', 0, 0, 'Pending GitHub access request', ?, ?, ?, ?, ?)""",
+        (candidate, no_key_sentinel(), github_id, gh_login, gh_name, now, now),
+    )
+    return conn.execute("SELECT * FROM contributors WHERE login=?", (candidate,)).fetchone(), True
+
+
+def list_active_api_keys(conn: sqlite3.Connection, contributor_login: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        """SELECT key_id, contributor_login, key_prefix, label, created_at, last_used_at, revoked_at
+           FROM api_keys
+           WHERE contributor_login=? AND revoked_at IS NULL
+           ORDER BY created_at ASC""",
+        (contributor_login,),
+    ).fetchall()
+
+
+def _sync_contributor_primary_key_hash(conn: sqlite3.Connection, contributor_login: str, revoked_hash: str | None = None) -> None:
+    """Keep contributors.key_hash clear of revoked hashes (and pointing at an active key if one exists)."""
+    row = conn.execute("SELECT key_hash FROM contributors WHERE login=?", (contributor_login,)).fetchone()
+    if row is None:
+        return
+    cur_hash = str(row["key_hash"] or "")
+    if revoked_hash is not None and cur_hash == revoked_hash:
+        other = conn.execute(
+            "SELECT key_hash FROM api_keys WHERE contributor_login=? AND revoked_at IS NULL ORDER BY created_at ASC LIMIT 1",
+            (contributor_login,),
+        ).fetchone()
+        new_hash = str(other["key_hash"]) if other is not None else no_key_sentinel()
+        conn.execute("UPDATE contributors SET key_hash=? WHERE login=?", (new_hash, contributor_login))
+    elif not is_real_key_hash(cur_hash):
+        first = conn.execute(
+            "SELECT key_hash FROM api_keys WHERE contributor_login=? AND revoked_at IS NULL ORDER BY created_at ASC LIMIT 1",
+            (contributor_login,),
+        ).fetchone()
+        if first is not None:
+            conn.execute("UPDATE contributors SET key_hash=? WHERE login=?", (str(first["key_hash"]), contributor_login))
+
+
+def create_api_key(
+    conn: sqlite3.Connection,
+    contributor_login: str,
+    *,
+    label: str = "",
+    max_live: int | None = None,
+) -> tuple[dict[str, Any], str]:
+    limit = config.MAX_LIVE_KEYS_PER_ACCOUNT if max_live is None else max_live
+    live = int(
+        conn.execute(
+            "SELECT COUNT(*) AS n FROM api_keys WHERE contributor_login=? AND revoked_at IS NULL",
+            (contributor_login,),
+        ).fetchone()["n"]
+    )
+    if live >= limit:
+        raise ValueError(f"maximum {limit} live API keys per account")
+    raw_key = "drs_wrk_" + secrets.token_urlsafe(32)
+    kh = hash_api_key(raw_key)
+    pref = key_prefix(raw_key)
+    kid = "key_" + secrets.token_hex(8)
+    clean_label = (label or "").strip()[:64]
+    now = utc_ms()
+    conn.execute(
+        """INSERT INTO api_keys (key_id, contributor_login, key_hash, key_prefix, label, created_at, last_used_at, revoked_at)
+           VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)""",
+        (kid, contributor_login, kh, pref, clean_label, now),
+    )
+    _sync_contributor_primary_key_hash(conn, contributor_login)
+    return {
+        "key_id": kid,
+        "prefix": pref,
+        "label": clean_label,
+        "created_at": now,
+        "created_utc": utc_iso(now),
+        "last_used_at": None,
+        "last_used_utc": None,
+    }, raw_key
+
+
+def rotate_api_key(
+    conn: sqlite3.Connection,
+    contributor_login: str,
+    key_id: str,
+    *,
+    label: str | None = None,
+) -> tuple[dict[str, Any], str] | None:
+    old = conn.execute(
+        "SELECT * FROM api_keys WHERE key_id=? AND contributor_login=? AND revoked_at IS NULL",
+        (key_id, contributor_login),
+    ).fetchone()
+    if old is None:
+        return None
+    now = utc_ms()
+    conn.execute("UPDATE api_keys SET revoked_at=? WHERE key_id=?", (now, key_id))
+    _sync_contributor_primary_key_hash(conn, contributor_login, revoked_hash=str(old["key_hash"]))
+
+    new_label = (label if label is not None else str(old["label"] or "")).strip()[:64]
+    raw_key = "drs_wrk_" + secrets.token_urlsafe(32)
+    kh = hash_api_key(raw_key)
+    pref = key_prefix(raw_key)
+    new_kid = "key_" + secrets.token_hex(8)
+    conn.execute(
+        """INSERT INTO api_keys (key_id, contributor_login, key_hash, key_prefix, label, created_at, last_used_at, revoked_at)
+           VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)""",
+        (new_kid, contributor_login, kh, pref, new_label, now),
+    )
+    _sync_contributor_primary_key_hash(conn, contributor_login)
+    return {
+        "key_id": new_kid,
+        "revoked_key_id": key_id,
+        "prefix": pref,
+        "label": new_label,
+        "created_at": now,
+        "created_utc": utc_iso(now),
+        "last_used_at": None,
+        "last_used_utc": None,
+    }, raw_key
+
+
+def revoke_api_key(conn: sqlite3.Connection, contributor_login: str, key_id: str) -> dict[str, Any] | None:
+    old = conn.execute(
+        "SELECT * FROM api_keys WHERE key_id=? AND contributor_login=? AND revoked_at IS NULL",
+        (key_id, contributor_login),
+    ).fetchone()
+    if old is None:
+        return None
+    now = utc_ms()
+    conn.execute("UPDATE api_keys SET revoked_at=? WHERE key_id=?", (now, key_id))
+    _sync_contributor_primary_key_hash(conn, contributor_login, revoked_hash=str(old["key_hash"]))
+    return {"key_id": key_id, "prefix": str(old["key_prefix"]), "revoked_at": now}
+
+
+def revoke_all_api_keys(conn: sqlite3.Connection, contributor_login: str) -> int:
+    now = utc_ms()
+    cur = conn.execute(
+        "UPDATE api_keys SET revoked_at=? WHERE contributor_login=? AND revoked_at IS NULL",
+        (now, contributor_login),
+    )
+    conn.execute(
+        "UPDATE contributors SET key_hash=? WHERE login=? AND is_admin=0",
+        (no_key_sentinel(), contributor_login),
+    )
+    return int(cur.rowcount or 0)
 
 
 def trigger_downstream_readiness(
