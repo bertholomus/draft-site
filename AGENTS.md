@@ -12,8 +12,9 @@ slots on job `glm53-dspine-labels-prod`, generates greedy labels, uploads them, 
 
 ## Hard rules (do not break)
 
-1. **Never print, log, commit, or paste the contributor key** (`drs_wrk_...`). Read it only from a file with
-   mode `0600`. Never put it in an issue, a commit, a shell history line you show, or a chat message.
+1. **Protect the contributor key** (`drs_wrk_...`). The human may hand it to you directly; that is expected.
+   Save it at once to `~/.config/draft-site/key` with mode `0600` (step 1) and from then on read it only from
+   that file. Never print it back, log it, commit it, or put it in an issue or a message.
 2. **Do not modify** `worker/label_worker.py` or `worker/client.py` logic: not prompts, sampling, token
    handling, retry, or upload code. Greedy decoding is required (`temperature 0.0`, `top_p 1.0`). Changing it
    produces rejected uploads and strikes.
@@ -43,6 +44,13 @@ slots on job `glm53-dspine-labels-prod`, generates greedy labels, uploads them, 
 | Strikes | each rejected upload = 1; 3 = quarantine |
 | Python | 3.10+, stdlib only (plus `tokenizers` in tokenizer mode) |
 
+## What "just give it the key" means
+
+With the key and a running GLM-5.3 server, you can do everything else yourself: save the key, check the
+account, detect the model id and token-id support, read the engine digest from Docker, run the test slot,
+watch verification, and start the continuous run. Ask the human only for what you cannot detect: the server
+URL if it is not `http://127.0.0.1:8100`, and the engine build commit if Docker labels don't show it.
+
 ## Procedure
 
 ### Step 1 — Preconditions (check, don't assume)
@@ -54,9 +62,14 @@ LLM=http://127.0.0.1:8100                           # ask the human if their ser
 curl -sf $LLM/v1/models                             # must list a GLM-5.3 model id
 ```
 
-If the key file is missing, ask the human to create it themselves:
-`mkdir -p ~/.config/draft-site && printf '%s\n' '<key>' > ~/.config/draft-site/key && chmod 600 ~/.config/draft-site/key`.
-Do not ask them to paste the key to you.
+If the key file is missing, ask the human for the key (or take it from their message) and save it yourself
+without echoing it:
+
+```bash
+mkdir -p ~/.config/draft-site
+( umask 077; printf '%s\n' "$DRS_KEY" > ~/.config/draft-site/key )   # DRS_KEY = the key the human gave you
+chmod 600 ~/.config/draft-site/key; unset DRS_KEY
+```
 
 ### Step 2 — Account check
 
