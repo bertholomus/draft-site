@@ -43,12 +43,17 @@ def _raw_http(
     hdrs = {"User-Agent": "drs-redteam/1.0"}
     if headers:
         hdrs.update(headers)
-    req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
-    try:
-        with _NO_REDIRECT_OPENER.open(req, timeout=15) as r:
-            return r.status, r.headers, r.read()
-    except urllib.error.HTTPError as e:
-        return e.code, e.headers, e.read()
+    for attempt in range(2):
+        req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
+        try:
+            with _NO_REDIRECT_OPENER.open(req, timeout=15) as r:
+                return r.status, r.headers, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers, e.read()
+        except (ConnectionResetError, urllib.error.URLError) as e:
+            if attempt == 0:
+                continue
+            raise
 
 
 def _raw_http_status(url: str, headers: dict[str, str]) -> int:
@@ -348,15 +353,30 @@ def main() -> None:
             # Bad state with real cookie -> 400
             st_cb_bad = _raw_http_status(pub_base + "/auth/callback?code=fake&state=wrong_state", {"Cookie": cookie_pair})
             record("gh_callback_bad_state_400", st_cb_bad == 400, f"HTTP {st_cb_bad}")
-            # Missing cookie with real state -> 400 (and burns state!)
+            # Missing cookie with real state -> 400
             st_cb_noc = _raw_http_status(pub_base + f"/auth/callback?code=fake&state={urllib.parse.quote(state_val)}", {})
             record("gh_callback_missing_cookie_400", st_cb_noc == 400, f"HTTP {st_cb_noc}")
-            # Replayed state with real cookie -> STILL 400 (already burned!)
-            st_cb_rep = _raw_http_status(
+            # Wrong cookie with real state -> 400 (and atomically burns state!)
+            st_cb_wrongc = _raw_http_status(
+                pub_base + f"/auth/callback?code=fake&state={urllib.parse.quote(state_val)}",
+                {"Cookie": "__Host-drs_oauth_state=wrong_browser_nonce_value"},
+            )
+            record("gh_callback_wrong_cookie_400", st_cb_wrongc == 400, f"HTTP {st_cb_wrongc}")
+            # Replayed state even with the original valid cookie -> 400 (already burned!)
+            st_cb_rep1 = _raw_http_status(
                 pub_base + f"/auth/callback?code=fake&state={urllib.parse.quote(state_val)}",
                 {"Cookie": cookie_pair},
             )
-            record("gh_callback_replayed_state_400", st_cb_rep == 400, f"HTTP {st_cb_rep}")
+            record("gh_callback_replayed_after_wrong_cookie_400", st_cb_rep1 == 400, f"HTTP {st_cb_rep1}")
+            # Fresh state consumed once (502 on fake GitHub code) -> replay MUST be 400!
+            _, hdr_l2, _ = _raw_http(pub_base + "/auth/login")
+            qs2 = urllib.parse.parse_qs(urllib.parse.urlsplit(hdr_l2.get("Location", "")).query)
+            st2 = (qs2.get("state") or [""])[0]
+            sc2 = [c for c in (hdr_l2.get_all("Set-Cookie") or []) if c.startswith("__Host-drs_oauth_state=")]
+            cp2 = sc2[0].split(";", 1)[0] if sc2 else ""
+            st_use1 = _raw_http_status(pub_base + f"/auth/callback?code=fake_code&state={urllib.parse.quote(st2)}", {"Cookie": cp2})
+            st_use2 = _raw_http_status(pub_base + f"/auth/callback?code=fake_code&state={urllib.parse.quote(st2)}", {"Cookie": cp2})
+            record("gh_callback_single_use_and_replay_400", st_use1 == 502 and st_use2 == 400, f"first={st_use1} replay={st_use2}")
         else:
             st_cb_unconf = _raw_http_status(pub_base + "/auth/login", {})
             record("gh_oauth_unconfigured_503", st_cb_unconf == 503, f"HTTP {st_cb_unconf} (awaiting github_oauth.json)")
@@ -521,6 +541,29 @@ def main() -> None:
             )
             st_k1b_after = _raw_http_status(pub_base + "/api/me", {"X-Quant": "1", "Authorization": f"Bearer {k1b_raw}"})
             record("gh_key_revoke_immediate_401", st_rev == 200 and st_k1b_after == 401, f"rev={st_rev} after={st_k1b_after}")
+
+            # Session fixation / rotation at login: rotating session invalidates old session immediately!
+            rot_out = _docker_exec_py(
+                args.docker_container,
+                "import json, sys\n"
+                "from server import db\n"
+                "with db.tx(immediate=True) as conn:\n"
+                "    sid2, csrf2 = db.create_session(conn, sys.argv[1], old_session_token=sys.argv[2])\n"
+                "print(json.dumps({'sid': sid2, 'csrf': csrf2}))\n",
+                args.test_login,
+                a_sid,
+            )
+            rot_d = json.loads(rot_out.strip())
+            a_sid2, a_csrf2 = rot_d["sid"], rot_d["csrf"]
+            _, _, body_old_sess = _raw_http(pub_base + "/auth/me", headers={"Cookie": a_cookie})
+            _, _, body_new_sess = _raw_http(pub_base + "/auth/me", headers={"Cookie": f"__Host-drs_session={a_sid2}"})
+            record(
+                "gh_session_fixation_rotation_invalidates_old",
+                (a_sid2 != a_sid and json.loads(body_old_sess.decode()).get("authenticated") is False and json.loads(body_new_sess.decode()).get("authenticated") is True),
+                "old_sid=False new_sid=True",
+            )
+            a_cookie = f"__Host-drs_session={a_sid2}"
+            a_csrf = a_csrf2
 
             # Logout invalidates session server-side
             st_lo, _, _ = _raw_http(
