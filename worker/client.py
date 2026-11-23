@@ -1,9 +1,16 @@
-"""Authenticated HTTP client for draft.bertholomus.com (quant.kindlingai.dev API style)."""
+"""Authenticated HTTP client for draft.bertholomus.com.
+
+Security properties (S11):
+- Sends Authorization: Bearer (and optional X-Origin-Auth) ONLY to the configured base_url origin.
+- Refuses HTTP redirects (301/302/303/307/308) so credentials can never leak cross-origin.
+- Requires an explicit 64-char hex SHA-256 checksum on every artifact download and verifies it before use.
+"""
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import re
 import secrets
 import time
 import urllib.error
@@ -12,7 +19,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-USER_AGENT = "draft-worker/1.0 (GLM-5.3 DSpine Community Pilot)"
+USER_AGENT = "draft-worker/1.1 (GLM-5.3 DSpine Label Client)"
+HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def sha256_file(path: Path) -> str:
@@ -37,16 +45,70 @@ class DraftSiteError(RuntimeError):
             self.json = None
 
 
-class DraftSiteClient:
-    def __init__(self, base_url: str, api_key: str | None = None, timeout: int = 240):
-        self.base_url = base_url.rstrip("/")
-        self.api_key = api_key.strip() if api_key else None
-        self.timeout = timeout
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Block all HTTP redirects so Authorization headers cannot be forwarded elsewhere."""
 
-    def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise DraftSiteError(code, f"HTTP redirect refused by client ({code} -> {newurl})")
+
+
+def _origin_tuple(url: str) -> tuple[str, str, int]:
+    p = urllib.parse.urlsplit(url)
+    scheme = p.scheme.lower()
+    host = (p.hostname or "").lower()
+    if not scheme or not host:
+        raise ValueError(f"invalid URL: {url}")
+    if p.port is not None:
+        port = p.port
+    elif scheme == "https":
+        port = 443
+    elif scheme == "http":
+        port = 80
+    else:
+        raise ValueError(f"unsupported URL scheme: {scheme}")
+    return (scheme, host, port)
+
+
+class DraftSiteClient:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str | None = None,
+        timeout: int = 240,
+        *,
+        origin_auth: str | None = None,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self._base_origin = _origin_tuple(self.base_url)
+        self.api_key = api_key.strip() if api_key else None
+        self.origin_auth = origin_auth.strip() if origin_auth else None
+        self.timeout = timeout
+        self._opener = urllib.request.build_opener(_NoRedirectHandler())
+
+    def _is_same_origin(self, url: str) -> bool:
+        try:
+            return _origin_tuple(url) == self._base_origin
+        except ValueError:
+            return False
+
+    def _resolve_same_origin_url(self, path_or_url: str) -> str:
+        if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
+            if not self._is_same_origin(path_or_url):
+                raise ValueError(
+                    f"refusing cross-origin request to {path_or_url} (expected origin {self.base_url})"
+                )
+            return path_or_url
+        if not path_or_url.startswith("/"):
+            path_or_url = "/" + path_or_url
+        return self.base_url + path_or_url
+
+    def _headers(self, url: str, extra: dict[str, str] | None = None) -> dict[str, str]:
         h = {"X-Quant": "1", "User-Agent": USER_AGENT, "Accept": "application/json"}
-        if self.api_key:
-            h["Authorization"] = f"Bearer {self.api_key}"
+        if self._is_same_origin(url):
+            if self.api_key:
+                h["Authorization"] = f"Bearer {self.api_key}"
+            if self.origin_auth:
+                h["X-Origin-Auth"] = self.origin_auth
         if extra:
             h.update(extra)
         return h
@@ -61,8 +123,8 @@ class DraftSiteClient:
         headers: dict[str, str] | None = None,
         retries: int = 3,
     ) -> Any:
-        url = path_or_url if path_or_url.startswith("http") else (self.base_url + path_or_url)
-        hdrs = self._headers(headers)
+        url = self._resolve_same_origin_url(path_or_url)
+        hdrs = self._headers(url, headers)
         data = raw_body
         if json_body is not None:
             data = json.dumps(json_body).encode("utf-8")
@@ -72,11 +134,13 @@ class DraftSiteClient:
         for attempt in range(retries):
             req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                with self._opener.open(req, timeout=self.timeout) as resp:
                     raw = resp.read()
                     if not raw:
                         return {}
                     return json.loads(raw.decode("utf-8"))
+            except DraftSiteError:
+                raise
             except urllib.error.HTTPError as e:
                 body = e.read().decode("utf-8", errors="replace")
                 if e.code in (502, 503, 504) and attempt + 1 < retries:
@@ -96,8 +160,9 @@ class DraftSiteClient:
     def jobs(self) -> list[dict[str, Any]]:
         return self._request("GET", "/api/jobs")
 
-    def grid(self, job: str) -> dict[str, Any]:
-        return self._request("GET", f"/api/grid?job={urllib.parse.quote(job)}")
+    def grid(self, job: str, offset: int = 0, limit: int = 500) -> dict[str, Any]:
+        q = urllib.parse.urlencode({"job": job, "offset": offset, "limit": limit})
+        return self._request("GET", f"/api/grid?{q}")
 
     def runners(self) -> list[dict[str, Any]]:
         return self._request("GET", "/api/runners")
@@ -145,28 +210,56 @@ class DraftSiteClient:
     def release(self, job: str, slot_id: str) -> dict[str, Any]:
         return self._request("DELETE", f"/api/claims/{urllib.parse.quote(job)}/{urllib.parse.quote(slot_id)}")
 
-    # --- Streaming artifact download with SHA-256 verification ---
-    def download_artifact(self, url_or_id: str, dest: Path, expected_sha256: str | None = None) -> Path:
-        url = url_or_id if url_or_id.startswith("http") else f"{self.base_url}/api/artifacts/{url_or_id}"
+    # --- Streaming artifact download with MANDATORY SHA-256 verification (S11) ---
+    def download_artifact(
+        self,
+        url_or_id: str,
+        dest: Path,
+        expected_sha256: str | None,
+        *,
+        allow_external: bool = False,
+    ) -> Path:
+        exp = (expected_sha256 or "").strip().lower()
+        if not HEX64_RE.match(exp):
+            raise ValueError("expected_sha256 (64-char hex) is required for verified artifact download")
+
+        if url_or_id.startswith("http://") or url_or_id.startswith("https://"):
+            if not allow_external and not self._is_same_origin(url_or_id):
+                raise ValueError(
+                    f"refusing cross-origin download from {url_or_id} (expected origin {self.base_url})"
+                )
+            url = url_or_id
+        else:
+            url = f"{self.base_url}/api/artifacts/{urllib.parse.quote(url_or_id)}"
+
+        dest = Path(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        if dest.is_file() and expected_sha256 and sha256_file(dest) == expected_sha256.lower():
+        if dest.is_file() and sha256_file(dest) == exp:
             return dest
+
         tmp = dest.with_suffix(dest.suffix + ".part")
-        req = urllib.request.Request(url, headers=self._headers(), method="GET")
+        # _headers() attaches Authorization ONLY when url matches self._base_origin
+        req = urllib.request.Request(url, headers=self._headers(url), method="GET")
         h = hashlib.sha256()
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp, tmp.open("wb") as out:
-            while True:
-                buf = resp.read(1024 * 1024)
-                if not buf:
-                    break
-                h.update(buf)
-                out.write(buf)
-        got = h.hexdigest()
-        if expected_sha256 and got != expected_sha256.lower():
+        try:
+            with self._opener.open(req, timeout=self.timeout) as resp, tmp.open("wb") as out:
+                hdr_sha = (resp.headers.get("X-SHA256") or "").strip().lower()
+                if hdr_sha and hdr_sha != exp:
+                    raise RuntimeError(f"server X-SHA256 {hdr_sha} != expected {exp}")
+                while True:
+                    buf = resp.read(1024 * 1024)
+                    if not buf:
+                        break
+                    h.update(buf)
+                    out.write(buf)
+            got = h.hexdigest()
+            if got != exp:
+                raise RuntimeError(f"download SHA-256 mismatch for {url}: got {got}, expected {exp}")
+            os.replace(tmp, dest)
+            return dest
+        except Exception:
             tmp.unlink(missing_ok=True)
-            raise RuntimeError(f"download SHA-256 mismatch for {url}: got {got}, expected {expected_sha256}")
-        os.replace(tmp, dest)
-        return dest
+            raise
 
     # --- Direct & chunked verified upload ---
     def upload_artifact(
@@ -206,7 +299,6 @@ class DraftSiteClient:
                 "manifest": manifest or {},
             },
         )
-        upload_id = init_resp["upload_id"]
         total_chunks = int(init_resp["total_chunks"])
         chunk_tmpl = init_resp["chunk_url_template"]
         complete_url = init_resp["complete_url"]

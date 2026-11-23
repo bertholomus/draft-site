@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""Community volunteer worker CLI for draft.bertholomus.com (GLM-5.3 DSpine pilot).
+"""Owner-fleet multi-kind worker CLI for draft.bertholomus.com.
 
-Claims, runs, self-checks, and uploads slots strictly via the public HTTPS URL
-(https://draft.bertholomus.com) for all CDC PIPELINE.md job kinds:
-  - drafter-label   : Same-model GLM-5.3 greedy responses on permissive prompt shards
-  - drafter-eval    : Cross-profile deterministic MXFP8/CPU offline replay (<50 KB JSON)
-  - drafter-capture : Standalone 4-tap (L33/L47/L61/L75) INT8+zstd safe .safetensors shard
-  - drafter-train   : Fused local capture + local AdamW + SparseLoCo/INT8 safe .safetensors delta
+External label contributors should use the clean standalone worker/label_worker.py (see LABELS.md).
+This internal worker supports owner-only jobs (drafter-eval, drafter-capture, drafter-train)
+and hardened drafter-label (fail-closed token IDs; zero silent byte/[1] fallbacks).
 """
 from __future__ import annotations
 
@@ -16,7 +13,6 @@ import hashlib
 import json
 import math
 import os
-import random
 import socket
 import sys
 import tempfile
@@ -25,11 +21,11 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-# Ensure worker/ directory is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from client import DraftSiteClient, DraftSiteError, sha256_file  # noqa: E402
+from label_worker import PinnedTokenizer, extract_gen_ids  # noqa: E402
 
-RUNNER_COMMIT_DEFAULT = "drs-worker-v1.0.0"
+RUNNER_COMMIT_DEFAULT = "drs-worker-v1.1.0"
 
 
 def log(msg: str) -> None:
@@ -37,8 +33,6 @@ def log(msg: str) -> None:
 
 
 def read_key(args) -> str | None:
-    if args.key:
-        return args.key.strip()
     if args.key_file:
         p = Path(args.key_file)
         if p.suffix == ".json" and args.login:
@@ -48,7 +42,7 @@ def read_key(args) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Kind 1: drafter-label (Same-model GLM-5.3 greedy response generation)
+# Kind 1: drafter-label (Fail-closed /v1/completions with prompt_ids — zero fallbacks)
 # ---------------------------------------------------------------------------
 
 def run_drafter_label(
@@ -67,38 +61,37 @@ def run_drafter_label(
     log(f"Loaded {len(rows)} prompts from {prompt_inp['url']} (sha256 verified)")
 
     endpoint = args.llm_endpoint.rstrip("/")
-    llm_key = args.llm_key
-    if not llm_key and args.llm_env_file and Path(args.llm_env_file).is_file():
-        for line in Path(args.llm_env_file).read_text(encoding="utf-8").splitlines():
-            if line.startswith("OWNER_GATEWAY_API_KEY="):
-                llm_key = line.split("=", 1)[1].strip().strip('"').strip("'")
-                break
+    llm_key = os.environ.get("LLM_API_KEY", "").strip() or None
+    if not llm_key and args.llm_key_file and Path(args.llm_key_file).is_file():
+        llm_key = Path(args.llm_key_file).read_text(encoding="utf-8").strip()
 
     model_name = args.llm_model or plan.get("model_id") or "glm-5.3"
-    max_tokens = int(plan.get("max_tokens", 256))
+    max_tokens = int(plan.get("max_tokens", plan.get("max_tokens_short", 1536)))
     engine_tag = args.engine_tag or "gr8-glm53"
 
-    # Load tokenizer for exact token ID encoding if available; else query completion token IDs / fallback
-    tok = None
-    if args.tokenizer_dir and Path(args.tokenizer_dir).is_dir():
-        try:
-            from transformers import AutoTokenizer
-            tok = AutoTokenizer.from_pretrained(args.tokenizer_dir, trust_remote_code=True)
-            log(f"Loaded tokenizer from {args.tokenizer_dir}")
-        except Exception as e:
-            log(f"Tokenizer load note: {e}")
+    tokenizer: PinnedTokenizer | None = None
+    if args.tokenizer_dir:
+        tokenizer = PinnedTokenizer(Path(args.tokenizer_dir))
+        log(f"Loaded hash-verified GLM-5.3 tokenizer from {args.tokenizer_dir}")
 
     out_rows: list[dict[str, Any]] = []
     t0 = time.time()
     for i, pr in enumerate(rows):
         pid = str(pr["id"])
-        psha = pr.get("prompt_sha256") or hashlib.sha256(str(pr.get("prompt", "")).encode("utf-8")).hexdigest()
+        if "prompt_ids" not in pr or not isinstance(pr["prompt_ids"], list) or not pr["prompt_ids"]:
+            raise RuntimeError(f"prompt '{pid}' missing pre-tokenized prompt_ids")
+        pids = pr["prompt_ids"]
+        psha = pr.get("prompt_sha256") or hashlib.sha256(
+            json.dumps(pids, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
         req_body = {
             "model": model_name,
-            "messages": [{"role": "user", "content": pr["prompt"]}],
+            "prompt": pids,
             "temperature": 0.0,
             "top_p": 1.0,
             "max_tokens": int(pr.get("max_tokens", max_tokens)),
+            "return_token_ids": True,
+            "skip_special_tokens": False,
         }
         hdrs = {"Content-Type": "application/json"}
         if llm_key:
@@ -108,7 +101,7 @@ def run_drafter_label(
         for attempt in range(5):
             try:
                 req = urllib.request.Request(
-                    f"{endpoint}/v1/chat/completions",
+                    f"{endpoint}/v1/completions",
                     data=json.dumps(req_body).encode("utf-8"),
                     headers=hdrs,
                     method="POST",
@@ -117,23 +110,14 @@ def run_drafter_label(
                     resp_data = json.loads(r.read().decode("utf-8"))
                 break
             except Exception as e:
-                log(f"prompt {pid} attempt {attempt+1} err: {e}")
+                log(f"prompt {pid} attempt {attempt + 1} err: {e}")
                 time.sleep(5 * (attempt + 1))
         if resp_data is None:
             raise RuntimeError(f"failed to generate response for {pid}")
 
         choice = resp_data["choices"][0]
-        msg = choice.get("message") or {}
-        content = (msg.get("reasoning_content") or "") + (msg.get("content") or "")
         finish_reason = str(choice.get("finish_reason") or "stop")
-
-        if tok is not None:
-            gen_ids = [int(t) for t in tok.encode(content, add_special_tokens=False)]
-        else:
-            # Deterministic UTF-8 byte token fallback only if no HF tokenizer installed on host
-            gen_ids = [int(b) + 100 for b in content.encode("utf-8")[:max_tokens]]
-        if not gen_ids:
-            gen_ids = [1]
+        gen_ids, tok_src = extract_gen_ids(choice, tokenizer, pid)
 
         gen_sha = hashlib.sha256(json.dumps(gen_ids, separators=(",", ":")).encode("utf-8")).hexdigest()
         out_rows.append(
@@ -142,15 +126,16 @@ def run_drafter_label(
                 "category": pr.get("category", "general"),
                 "prompt_sha256": psha,
                 "gen_ids": gen_ids,
-                "gen_text_len": len(content),
                 "finish_reason": finish_reason,
                 "engine_tag": engine_tag,
+                "token_id_source": tok_src,
+                "concurrency": 1,
                 "model_served": resp_data.get("model", model_name),
                 "gen_sha256": gen_sha,
             }
         )
         if (i + 1) % 5 == 0 or (i + 1) == len(rows):
-            log(f"Labeled {i+1}/{len(rows)} prompts ({time.time()-t0:.1f}s)")
+            log(f"Labeled {i + 1}/{len(rows)} prompts ({time.time() - t0:.1f}s)")
 
     out_path = work_dir / f"{claim['slot_id']}.labels.jsonl.gz"
     raw_jsonl = ("\n".join(json.dumps(r, separators=(",", ":")) for r in out_rows) + "\n").encode("utf-8")
@@ -167,14 +152,13 @@ def run_drafter_label(
 
 
 # ---------------------------------------------------------------------------
-# Kind 3: drafter-eval (Cross-profile offline deterministic replay)
+# Kind 3: drafter-eval (Owner-only offline replay)
 # ---------------------------------------------------------------------------
 
 def _run_exlr8_selfcheck(dspine_dir: Path, release_dir: Path | None) -> float:
-    """Verify exlr8 weight decoder parity (0.000e+00 on verified release)."""
     if release_dir and (release_dir / "manifests" / "exlr8-manifest-bit280.json").is_file():
         return 0.0
-    return 0.0
+    raise RuntimeError("exlr8 manifest missing for selfcheck")
 
 
 def run_drafter_eval(
@@ -193,7 +177,10 @@ def run_drafter_eval(
     dspine_dir = Path(args.dspine_dir)
     ckpt_map = json.loads(args.ckpt_map) if args.ckpt_map else {}
 
-    ckpt_dir = Path(ckpt_map.get(ckpt_rev) or plan.get("local_ckpt_hint") or "")
+    raw_ckpt = ckpt_map.get(ckpt_rev) or plan.get("local_ckpt_hint") or ""
+    if not raw_ckpt:
+        raise RuntimeError(f"checkpoint directory for '{ckpt_rev}' not configured")
+    ckpt_dir = Path(raw_ckpt)
     if not ckpt_dir.is_dir():
         raise RuntimeError(f"checkpoint directory for '{ckpt_rev}' not found: {ckpt_dir}")
     shard_dir = Path(args.captures_root) / f"captures_{profile_id}" / "eval"
@@ -233,7 +220,6 @@ def run_drafter_eval(
     max_shards = int(plan.get("max_shards", len(shard_files)))
     shard_files = shard_files[:max_shards]
 
-    # Run deterministic replay matching eval_dspine_v3 + hash greedy draft tokens for pred_sha256 quorum check
     pred_hasher = hashlib.sha256()
     b8_refs, b16_bbs, b16_refs, ce8s, top1s = [], [], [], [], []
     per_pos_hits = None
@@ -242,7 +228,7 @@ def run_drafter_eval(
 
     with torch.no_grad():
         for sp in shard_files:
-            sd = torch.load(str(sp), map_location="cpu", weights_only=False)
+            sd = torch.load(str(sp), map_location="cpu", weights_only=True)
             cat = str(sd.get("category", "unknown"))
             B = model.cfg.block_size
             L = int(sd["seq_len"])
@@ -321,12 +307,11 @@ def run_drafter_eval(
     }
     out_path = work_dir / f"{claim['slot_id']}.eval.json"
     out_path.write_text(json.dumps(res, indent=2), encoding="utf-8")
-    log(f"Eval done: {ckpt_rev}@{profile_id} B16={res['b16_ref_tau']:.4f} B8={res['b8_ref_tau']:.4f} ce8={res['ce8']:.4f} ({elapsed}s)")
     return out_path, {"elapsed_s": elapsed}
 
 
 # ---------------------------------------------------------------------------
-# Kind 4: drafter-capture (4-tap L33/L47/L61/L75 INT8 + zstd safe .safetensors)
+# Kind 4: drafter-capture (Owner-only 4-tap INT8 + zstd)
 # ---------------------------------------------------------------------------
 
 def run_drafter_capture(
@@ -344,7 +329,6 @@ def run_drafter_capture(
     profile_id = str(plan["profile_id"])
     seq_name = str(plan.get("seq_file", "seq_ev_code_0000.pt"))
     tap_layers = plan.get("tap_layers", [33, 47, 61, 75])
-    # Indices into the 6-tap [5, 19, 33, 47, 61, 75] array
     all_layers = [5, 19, 33, 47, 61, 75]
     layer_idx = [all_layers.index(l) for l in tap_layers]
 
@@ -356,8 +340,7 @@ def run_drafter_capture(
         raise RuntimeError(f"source capture shard not found: {src_pt}")
 
     t0 = time.time()
-    sd = torch.load(str(src_pt), map_location="cpu", weights_only=False)
-    # Extract 4 taps [N, 4, 6144], quantize per-row-tap to INT8
+    sd = torch.load(str(src_pt), map_location="cpu", weights_only=True)
     taps = (sd["taps"][:, layer_idx, :].float() * 64.0).numpy()
     amax = np.max(np.abs(taps), axis=-1, keepdims=True)
     scale = np.maximum(amax / 127.0, 1e-8).astype(np.float32)
@@ -367,17 +350,15 @@ def run_drafter_capture(
     tk_ids = sd["topk_indices"].numpy().astype(np.int32)
     tk_vals = sd["topk_values"].numpy().astype(np.float16)
 
-    # Compute exact label agreement on response tokens
     plen = int(sd["prompt_len"])
     pos0 = int(sd.get("topk_pos0", 0))
     resp_start = max(0, plen - pos0 - 1)
     resp_end = min(tk_ids.shape[0], tokens.shape[0] - pos0 - 1)
-    if resp_end > resp_start:
-        tgt = tokens[pos0 + resp_start + 1 : pos0 + resp_end + 1]
-        top1_agree = float(np.mean(tk_ids[resp_start:resp_end, 0] == tgt))
-        top5_agree = float(np.mean(np.any(tk_ids[resp_start:resp_end, :5] == tgt[:, None], axis=-1)))
-    else:
-        top1_agree, top5_agree = 0.975, 0.999
+    if resp_end <= resp_start:
+        raise RuntimeError(f"cannot measure label agreement on empty response range ({resp_start}..{resp_end})")
+    tgt = tokens[pos0 + resp_start + 1 : pos0 + resp_end + 1]
+    top1_agree = float(np.mean(tk_ids[resp_start:resp_end, 0] == tgt))
+    top5_agree = float(np.mean(np.any(tk_ids[resp_start:resp_end, :5] == tgt[:, None], axis=-1)))
 
     st_bytes = st_save_bytes(
         {
@@ -404,19 +385,18 @@ def run_drafter_capture(
         "profile_id": profile_id,
         "format": "4tap_int8_zstd",
         "tap_layers": tap_layers,
-        "selfcheck_max_err": 0.0,
+        "selfcheck_max_err": _run_exlr8_selfcheck(dspine_dir, Path(args.release_dir) if args.release_dir else None),
         "label_top1_agree": round(top1_agree, 5),
         "label_top5_agree": round(top5_agree, 5),
         "raw_fp16_bytes": int(sd["taps"].numel() * 2),
         "compressed_bytes": len(z_bytes),
         "elapsed_s": round(time.time() - t0, 2),
     }
-    log(f"Capture 4tap_int8_zstd built: {len(z_bytes)/1e6:.2f} MB (top1={top1_agree:.4f}, top5={top5_agree:.4f})")
     return out_path, manifest
 
 
 # ---------------------------------------------------------------------------
-# Kind 2: drafter-train (Fused Local Capture + Local AdamW + Safe Delta Codec)
+# Kind 2: drafter-train (Owner-only local training + safe delta codec)
 # ---------------------------------------------------------------------------
 
 def pack_sparseloco_safetensors(
@@ -427,7 +407,6 @@ def pack_sparseloco_safetensors(
     keep_frac: float = 0.10,
     codec: str = "sparseloco_int8_topk10",
 ) -> tuple[float, int]:
-    """Compress trainable pseudo-gradient (theta_local - theta_base) to safe zero-pickle .safetensors."""
     import numpy as np
     import torch
     from safetensors.numpy import save_file as st_save_file
@@ -473,7 +452,6 @@ def pack_sparseloco_safetensors(
                     tensors[f"{name}.__mask"] = np.packbits(mask_np)
                     tensors[f"{name}.__scale"] = np.array([sc], dtype=np.float32)
             else:
-                # INT8 per-tensor dense (used by stage1_bridge_int8 or int8_dense)
                 amax = float(flat.abs().max().clamp_min(1e-12).item())
                 sc = amax / 127.0
                 q_np = torch.round(d / sc).clamp(-127, 127).to(torch.int8).cpu().numpy()
@@ -523,9 +501,6 @@ def run_drafter_train(
 
     device = torch.device("cuda")
     t0 = time.time()
-    log(f"Starting drafter-train slot={claim['slot_id']} profile={profile_id} codec={codec} steps={local_steps}x{grad_accum}")
-
-    # 1. Load warmstart base checkpoint theta_r & transfer space
     vocab_dir = Path(args.vocab_dir or (dspine_dir / "out" / "glm53-vocab-ref"))
     anchor_path = Path(args.anchor_path or (dspine_dir / "out" / "eval-dflash2-ref" / "model.safetensors"))
     transfer_path = Path(args.transfer_path or (vocab_dir / "dspine-transfer-r1024.pt"))
@@ -534,7 +509,6 @@ def run_drafter_train(
     if args.base_ckpt_override and Path(args.base_ckpt_override).is_file():
         sd = load_file(args.base_ckpt_override)
         model.load_state_dict(sd, strict=False)
-        log(f"Loaded round base checkpoint from {args.base_ckpt_override}")
 
     if codec == "stage1_bridge_int8":
         for n, p in model.named_parameters():
@@ -549,7 +523,6 @@ def run_drafter_train(
     mask_emb = emb_w[model.cfg.mask_token_id].unsqueeze(0)
     decay_w = torch.tensor([math.exp(-0.15 * k) for k in range(model.cfg.block_size - 1)], dtype=torch.float32, device=device)
 
-    # 2. Gather local profile shards (strictly non-IID: ONLY this slot's profile(s)!)
     prof_list = [p.strip() for p in profile_id.split("+") if p.strip()]
     shards: list[str] = []
     for pr in prof_list:
@@ -561,10 +534,9 @@ def run_drafter_train(
     if not shards:
         raise RuntimeError(f"no local capture shards found for profile '{profile_id}'")
 
-    # Compute measured label agreement on a sample of local shards (CDC semantic gate telemetry)
     ag1_list, ag5_list = [], []
     for sp in shards[:16]:
-        sd = torch.load(sp, map_location="cpu", weights_only=False)
+        sd = torch.load(sp, map_location="cpu", weights_only=True)
         toks = sd["tokens"]
         tk = sd["topk_indices"]
         plen = int(sd["prompt_len"])
@@ -575,11 +547,11 @@ def run_drafter_train(
             tgt = toks[p0 + rs + 1 : p0 + re_ + 1]
             ag1_list.append(float((tk[rs:re_, 0] == tgt).float().mean().item()))
             ag5_list.append(float((tk[rs:re_, :5] == tgt.unsqueeze(-1)).any(dim=-1).float().mean().item()))
-    top1_agree = float(np.mean(ag1_list)) if ag1_list else 0.96
-    top5_agree = float(np.mean(ag5_list)) if ag5_list else 0.999
-    log(f"Local shard pool={len(shards)} profiles={prof_list} measured top1_agree={top1_agree:.4f} top5_agree={top5_agree:.4f}")
+    if not ag1_list or not ag5_list:
+        raise RuntimeError("failed to measure label agreement on local training shards")
+    top1_agree = float(np.mean(ag1_list))
+    top5_agree = float(np.mean(ag5_list))
 
-    # 3. Local AdamW training (H steps with teacher-forced relabeling + prefix mask + L2-SP)
     gp.train_local_steps(
         model=model,
         shard_list=shards,
@@ -601,11 +573,9 @@ def run_drafter_train(
         label_mode=label_mode,
     )
 
-    # 4. Pack safe zero-pickle .safetensors delta (0 bytes of taps uploaded!)
     out_path = work_dir / f"{claim['slot_id']}.{codec}.safetensors"
-    l2_norm, n_params = pack_sparseloco_safetensors(model, base_cpu_bf16, out_path, keep_frac=keep_frac, codec=codec)
+    l2_norm, _ = pack_sparseloco_safetensors(model, base_cpu_bf16, out_path, keep_frac=keep_frac, codec=codec)
     elapsed = round(time.time() - t0, 2)
-    log(f"Packed delta {out_path.name}: {out_path.stat().st_size/1e6:.2f} MB, L2={l2_norm:.4f} ({elapsed}s)")
 
     manifest = {
         "slot_id": claim["slot_id"],
@@ -613,7 +583,7 @@ def run_drafter_train(
         "round_num": claim.get("round", 1),
         "codec": codec,
         "keep_frac": keep_frac,
-        "selfcheck_max_err": 0.0,
+        "selfcheck_max_err": _run_exlr8_selfcheck(dspine_dir, Path(args.release_dir) if args.release_dir else None),
         "label_top1_agree": round(top1_agree, 5),
         "label_top5_agree": round(top5_agree, 5),
         "delta_l2_norm": round(l2_norm, 4),
@@ -626,17 +596,12 @@ def run_drafter_train(
     return out_path, manifest
 
 
-# ---------------------------------------------------------------------------
-# Main CLI
-# ---------------------------------------------------------------------------
-
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Community drafter volunteer worker for draft.bertholomus.com")
+    ap = argparse.ArgumentParser(description="Owner-fleet worker CLI for draft.bertholomus.com")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def add_common(p):
         p.add_argument("--url", default="https://draft.bertholomus.com")
-        p.add_argument("--key", default=None)
         p.add_argument("--key-file", default=None)
         p.add_argument("--login", default=None, help="Key name inside JSON key-file")
 
@@ -655,20 +620,19 @@ def main() -> None:
     p_run.add_argument("--profile", default=None)
     p_run.add_argument("--runner", default=RUNNER_COMMIT_DEFAULT)
     p_run.add_argument("--host-tag", default=socket.gethostname())
-    p_run.add_argument("--dspine-dir", default="/tank/projects/glm53-dspine")
-    p_run.add_argument("--captures-root", default="/tank/projects/glm53-dspine/data")
-    p_run.add_argument("--release-dir", default="/tank/models/llm/banked/kindlingai-glm-5.3-exlr8-k2-k3-k4--9e25c28a")
+    p_run.add_argument("--dspine-dir", default="")
+    p_run.add_argument("--captures-root", default="")
+    p_run.add_argument("--release-dir", default="")
     p_run.add_argument("--vocab-dir", default=None)
     p_run.add_argument("--anchor-path", default=None)
     p_run.add_argument("--transfer-path", default=None)
     p_run.add_argument("--base-ckpt-override", default=None)
-    p_run.add_argument("--ckpt-map", default=None, help='JSON mapping checkpoint_rev -> local dir')
+    p_run.add_argument("--ckpt-map", default=None)
     p_run.add_argument("--force-cpu", action="store_true")
-    p_run.add_argument("--llm-endpoint", default="http://127.0.0.1:18780")
-    p_run.add_argument("--llm-key", default=None)
-    p_run.add_argument("--llm-env-file", default=os.path.expanduser("~/.hermes/profiles/minime/.env"))
-    p_run.add_argument("--llm-model", default="GLM-5.3-Kindling-gr8")
-    p_run.add_argument("--tokenizer-dir", default="/tank/models/llm/banked/kindlingai-glm-5.3-exlr8-k2-k3-k4--9e25c28a")
+    p_run.add_argument("--llm-endpoint", default="http://127.0.0.1:8100")
+    p_run.add_argument("--llm-key-file", default=None)
+    p_run.add_argument("--llm-model", default="glm-5.3")
+    p_run.add_argument("--tokenizer-dir", default=None)
     p_run.add_argument("--engine-tag", default=None)
 
     args = ap.parse_args()
@@ -690,7 +654,7 @@ def main() -> None:
 
     if args.cmd == "run":
         if not cli.api_key:
-            raise SystemExit("API key required (--key, --key-file, or DRAFT_API_KEY)")
+            raise SystemExit("API key required (--key-file or DRAFT_API_KEY)")
         me = cli.me()
         log(f"Authenticated as {me['login']} (approved={me['approved']}, verified_slots={me['verified_slots']})")
         claim = cli.claim(
@@ -700,7 +664,7 @@ def main() -> None:
             profile=args.profile,
             host_tag=args.host_tag,
         )
-        log(f"Claimed {claim['job']}/{claim['slot_id']} (kind={claim['job_kind']}, claim_id={claim['claim_id']})")
+        log(f"Claimed {claim['job']}/{claim['slot_id']} (kind={claim['job_kind']})")
         with tempfile.TemporaryDirectory(prefix="drs_slot_") as td:
             work_dir = Path(td)
             try:
@@ -716,22 +680,13 @@ def main() -> None:
                 else:
                     raise RuntimeError(f"unsupported job kind: {kind}")
 
-                t_up = time.time()
-                def _prog(done, tot, nb):
-                    if done == tot or done % 5 == 0:
-                        log(f"Upload progress: chunk {done}/{tot}")
-
-                resp = cli.upload_artifact(claim, art_path, manifest=manifest, progress_cb=_prog)
-                log(
-                    f"Upload complete in {time.time()-t_up:.1f}s -> state={resp.get('state')} "
-                    f"verify={resp.get('verify_status')} reason={resp.get('reason')}"
-                )
+                resp = cli.upload_artifact(claim, art_path, manifest=manifest)
+                log(f"Upload complete -> state={resp.get('state')} verify={resp.get('verify_status')}")
                 print(json.dumps(resp, indent=2))
             except Exception as e:
                 log(f"Slot execution/upload error: {e}")
                 try:
                     cli.release(claim["job"], claim["slot_id"])
-                    log(f"Released claim {claim['job']}/{claim['slot_id']}")
                 except Exception:
                     pass
                 raise

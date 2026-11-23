@@ -133,7 +133,7 @@ def main() -> None:
             "model": "GLM-5.3",
             "release_repo": RELEASE_REPO,
             "release_revision": RELEASE_REV,
-            "config": {"prompt_pack": "open-perfectblend-permissive", "verification": "schema+prompt_sha256+semantic_top1>=92%"},
+            "config": {"prompt_pack": "open-perfectblend-permissive", "verification": "Phase-A schema/SHA256 + Phase-B owner HMAC-sampled 8x10 teacher-forced spot gate"},
             "slots": label_slots,
         },
     )

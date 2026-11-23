@@ -22,8 +22,12 @@ services:
       DRAFT_DATA_DIR: /data
       DRAFT_SECRETS_DIR: /secrets
       DRAFT_PUBLIC_URL: https://draft.bertholomus.com
-      DRAFT_ORIGIN_HOST: draft-origin.albertlee.co
       DRAFT_REQUIRE_ORIGIN_AUTH: "1"
+      DRAFT_BOOTSTRAP_WORKER_KEYS: "0"
+      DRAFT_LABEL_TRUSTED_LOGINS: "bertholomus-w1"
+      DRAFT_NON_OWNER_KINDS: "drafter-label"
+      DRAFT_MAX_CLAIMS_PER_LOGIN: "2"
+      DRAFT_MAX_STRIKES: "3"
     volumes:
       - /tank/projects/draft-site/data:/data:rw
-      - /tank/projects/draft-site/secrets:/secrets:ro
+      - /tank/projects/draft-site/secrets/server:/secrets:ro

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Persistent concurrent (C=8) drafter-label fleet worker & verified-label harvester for draft.bertholomus.com.
+"""Persistent concurrent (C=8) owner drafter-label fleet worker & verified-label harvester.
 
 - Claims production 200-prompt shards from glm53-dspine-labels-prod via https://draft.bertholomus.com
-- Generates exact token-ID greedy labels (/v1/completions with prompt_ids + return_token_ids=True) at C=8 (~156 tok/s)
+- Generates exact token-ID greedy labels (/v1/completions with prompt_ids + return_token_ids=True)
+- FAIL CLOSED: raises hard error if the engine omits or returns empty/invalid token_ids (zero fallbacks)
 - Respects A1-A4 lane windows cleanly (anchored ^- (DSP|DRS) WINDOW-START/END; window waits NEVER consume retries)
-- Persists every completed prompt to a per-slot disk cache so zero completed prompts are ever discarded
+- Persists every completed prompt to a per-slot disk cache keyed by (slot_id, shard_sha, model_id)
 - Uploads verified .labels.jsonl.gz via https://draft.bertholomus.com
 - Appends verified rows in exact DSpine train_labels.jsonl schema to --export-out
 """
@@ -32,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from client import DraftSiteClient, DraftSiteError  # noqa: E402
 
 STOP = False
+VOCAB_SIZE = 154_880
 _WIN_RE = re.compile(r"^- (?:DSP|DRS) WINDOW-(START|END)\b")
 
 
@@ -89,6 +91,36 @@ def wait_for_lane_ready(endpoint: str, dspine_progress: Path | None, quiet: bool
     return "glm-5.3"
 
 
+def extract_strict_token_ids(choice: dict[str, Any], prompt_id: str) -> list[int]:
+    """Require valid non-empty integer token_ids from the engine; NEVER fabricate fallback tokens."""
+    gids = choice.get("token_ids")
+    if not isinstance(gids, list) or len(gids) == 0:
+        raise RuntimeError(
+            f"engine returned missing/empty token_ids for prompt {prompt_id}; silent token fallbacks are disabled"
+        )
+    out: list[int] = []
+    for t in gids:
+        if type(t) is not int or t < 0 or t >= VOCAB_SIZE:
+            raise RuntimeError(f"invalid token id {t!r} from engine for prompt {prompt_id}")
+        out.append(t)
+    return out
+
+
+def _load_api_key(key_file: str | None, login: str | None) -> str:
+    if key_file:
+        p = Path(key_file)
+        raw = p.read_text(encoding="utf-8").strip()
+        if p.suffix == ".json":
+            if not login:
+                raise SystemExit("--login is required when --key-file is a JSON map")
+            return str(json.loads(raw)[login]).strip()
+        return raw
+    env_key = os.environ.get("DRAFT_API_KEY", "").strip()
+    if env_key:
+        return env_key
+    raise SystemExit("API key required via --key-file or DRAFT_API_KEY")
+
+
 def run_one_slot(
     cli: DraftSiteClient,
     claim: dict[str, Any],
@@ -99,31 +131,40 @@ def run_one_slot(
     dspine_progress: Path | None,
     export_path: Path | None,
     cache_dir: Path,
+    *,
+    engine_image_digest: str = "owner-a14-serving",
+    engine_signature: str = "owner-a14-gr8",
+    quant_profile: str = "bit280",
 ) -> dict[str, Any]:
     plan = claim["plan"]
     slot_id = str(claim["slot_id"])
     inp = next(x for x in claim["inputs"] if x["name"] in ("prompt_shard", "prompts"))
+    shard_sha = str(inp.get("sha256") or "")
 
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = cache_dir / f"{slot_id}.cache.jsonl"
+    safe_model = re.sub(r"[^a-zA-Z0-9._-]", "_", model_id)[:48]
+    cache_file = cache_dir / f"{slot_id}_{shard_sha[:12]}_{safe_model}.cache.jsonl"
+    # Preserve compatibility with any in-progress legacy cache file from before restart
+    legacy_cache_file = cache_dir / f"{slot_id}.cache.jsonl"
 
     with tempfile.TemporaryDirectory(prefix="drs_lbl_") as td:
         td_p = Path(td)
-        pf = cli.download_artifact(inp["url"], td_p / "prompts.jsonl", inp.get("sha256"))
+        pf = cli.download_artifact(inp["url"], td_p / "prompts.jsonl", shard_sha)
         prompts = [json.loads(ln) for ln in pf.read_text(encoding="utf-8").splitlines() if ln.strip()]
 
         # Load any previously persisted prompt results for this slot (zero lost work on restart/window)
         cached: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
-        if cache_file.is_file():
-            for ln in cache_file.read_text(encoding="utf-8", errors="ignore").splitlines():
-                if not ln.strip():
-                    continue
-                try:
-                    rec = json.loads(ln)
-                    if "result" in rec and "export" in rec and rec["result"].get("id"):
-                        cached[str(rec["result"]["id"])] = (rec["result"], rec["export"])
-                except Exception:
-                    pass
+        for cf_cand in (legacy_cache_file, cache_file):
+            if cf_cand.is_file():
+                for ln in cf_cand.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    if not ln.strip():
+                        continue
+                    try:
+                        rec = json.loads(ln)
+                        if "result" in rec and "export" in rec and rec["result"].get("id"):
+                            cached[str(rec["result"]["id"])] = (rec["result"], rec["export"])
+                    except Exception:
+                        pass
 
         log(
             f"Slot {slot_id}: loaded {len(prompts)} prompts (cached={len(cached)}, C={concurrency}, endpoint={endpoint})"
@@ -201,7 +242,6 @@ def run_one_slot(
             while real_failures < max_real_failures:
                 if STOP:
                     raise RuntimeError("worker stopping")
-                # Window wait NEVER counts against real_failures
                 maybe_wait_window()
                 if STOP:
                     raise RuntimeError("worker stopping")
@@ -218,7 +258,6 @@ def run_one_slot(
                     break
                 except Exception as e:
                     last_err = e
-                    # If a lane window just opened or the lane is restarting, wait without burning retry budget
                     if dspine_progress and endpoint_is_a14(endpoint) and a14_window_is_open(dspine_progress):
                         maybe_wait_window()
                         continue
@@ -226,7 +265,6 @@ def run_one_slot(
                         isinstance(e, urllib.error.HTTPError) and e.code in (429, 500, 502, 503, 504)
                     )
                     if is_conn_or_5xx:
-                        # Check if lane is actually down/restarting
                         wait_for_lane_ready(endpoint, dspine_progress, quiet=True)
                     real_failures += 1
                     if real_failures in (1, 5, 10, 20):
@@ -238,9 +276,7 @@ def run_one_slot(
 
             dt = round(time.time() - t_req, 3)
             ch = resp["choices"][0]
-            gids = ch.get("token_ids") or []
-            if not gids:
-                gids = [154829]  # EOS fallback if empty stop
+            gids = extract_strict_token_ids(ch, pid)
             gsha = hashlib.sha256(json.dumps(gids, separators=(",", ":")).encode("utf-8")).hexdigest()
             fr = str(ch.get("finish_reason") or "stop")
 
@@ -250,6 +286,12 @@ def run_one_slot(
                 "gen_ids": gids,
                 "finish_reason": fr,
                 "engine_tag": engine_tag,
+                "engine_image_digest": engine_image_digest,
+                "engine_signature": engine_signature,
+                "quant_profile": quant_profile,
+                "concurrency": concurrency,
+                "token_id_source": "engine",
+                "model_served": str(resp.get("model") or model_id),
                 "gen_sha256": gsha,
             }
             exp_obj = {
@@ -257,6 +299,9 @@ def run_one_slot(
                 "category": pr.get("category", "code"),
                 "source": pr.get("source", "permissive"),
                 "model_id": model_id,
+                "engine_tag": engine_tag,
+                "quant_profile": quant_profile,
+                "concurrency": concurrency,
                 "prompt_len": len(pids),
                 "gen_len": len(gids),
                 "total_len": len(pids) + len(gids),
@@ -270,7 +315,6 @@ def run_one_slot(
             results[idx] = res_obj
             export_recs[idx] = exp_obj
 
-            # Persist immediately so this prompt is never lost even if slot is interrupted
             with cache_lock:
                 with cache_file.open("a", encoding="utf-8") as cf:
                     cf.write(json.dumps({"result": res_obj, "export": exp_obj}, separators=(",", ":")) + "\n")
@@ -290,7 +334,6 @@ def run_one_slot(
         if todo:
             with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
                 futs = [ex.submit(do_prompt, i, pr) for i, pr in todo]
-                # Collect all futures even if one errors, so in-flight completions still persist to disk cache!
                 first_err: Exception | None = None
                 for fut in concurrent.futures.as_completed(futs):
                     try:
@@ -301,8 +344,12 @@ def run_one_slot(
                 if first_err is not None:
                     raise first_err
 
+        completed_results = [r for r in results if r is not None]
+        if len(completed_results) != len(prompts):
+            raise RuntimeError(f"incomplete shard {slot_id}: {len(completed_results)}/{len(prompts)}")
+
         out_gz = td_p / f"{slot_id}.labels.jsonl.gz"
-        raw_jsonl = "\n".join(json.dumps(r, separators=(",", ":")) for r in results if r is not None) + "\n"
+        raw_jsonl = "\n".join(json.dumps(r, separators=(",", ":")) for r in completed_results) + "\n"
         out_gz.write_bytes(gzip.compress(raw_jsonl.encode("utf-8"), compresslevel=6))
 
         elapsed = round(time.time() - t0, 2)
@@ -313,8 +360,12 @@ def run_one_slot(
             out_gz,
             manifest={
                 "slot_id": slot_id,
-                "n_rows": len(prompts),
+                "n_rows": len(completed_results),
                 "total_gen_tokens": gen_toks,
+                "engine_tag": engine_tag,
+                "engine_image_digest": engine_image_digest,
+                "engine_signature": engine_signature,
+                "quant_profile": quant_profile,
                 "concurrency": concurrency,
                 "agg_tok_s": agg_tps,
                 "elapsed_s": elapsed,
@@ -322,10 +373,9 @@ def run_one_slot(
             },
         )
         log(
-            f"Slot {slot_id} VERIFIED ({out_gz.stat().st_size} B gz, {gen_toks} tok in {active_elapsed}s active / {elapsed}s wall = {agg_tps} tok/s) -> {resp.get('state')}"
+            f"Slot {slot_id} UPLOADED ({out_gz.stat().st_size} B gz, {gen_toks} tok in {active_elapsed}s active / {elapsed}s wall = {agg_tps} tok/s) -> {resp.get('state')}"
         )
 
-        # Export exact DSpine-compatible schema rows for downstream DSpine ingestion
         if export_path and resp.get("state") == "verified":
             export_path.parent.mkdir(parents=True, exist_ok=True)
             with export_path.open("a", encoding="utf-8") as ef:
@@ -333,23 +383,24 @@ def run_one_slot(
                     if rec is not None:
                         ef.write(json.dumps(rec, separators=(",", ":")) + "\n")
                 ef.flush()
-            try:
-                cache_file.unlink(missing_ok=True)
-            except Exception:
-                pass
+            cache_file.unlink(missing_ok=True)
+            legacy_cache_file.unlink(missing_ok=True)
         return resp
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Persistent C8 drafter-label fleet worker")
     ap.add_argument("--url", default="https://draft.bertholomus.com")
-    ap.add_argument("--key-file", required=True)
-    ap.add_argument("--login", required=True)
+    ap.add_argument("--key-file", default=None)
+    ap.add_argument("--login", default=None)
     ap.add_argument("--job", default="glm53-dspine-labels-prod")
     ap.add_argument("--runner", default="drs-worker-v1.1.0")
     ap.add_argument("--endpoint", default="http://127.0.0.1:18090")
     ap.add_argument("--concurrency", type=int, default=8)
     ap.add_argument("--engine-tag", default="gr8-glm53-c8")
+    ap.add_argument("--engine-image-digest", default="owner-a14-serving")
+    ap.add_argument("--engine-signature", default="owner-a14-gr8")
+    ap.add_argument("--quant-profile", default="bit280")
     ap.add_argument("--dspine-progress", default="/tank/projects/glm53-dspine/PROGRESS.md")
     ap.add_argument("--export-out", default="/tank/projects/draft-site/data/exports/drs_labels.jsonl")
     ap.add_argument("--cache-dir", default="/tank/projects/draft-site/data/worker_cache")
@@ -357,8 +408,8 @@ def main() -> None:
     ap.add_argument("--poll-interval", type=int, default=30)
     args = ap.parse_args()
 
-    keys = json.loads(Path(args.key_file).read_text(encoding="utf-8"))
-    cli = DraftSiteClient(args.url, keys[args.login])
+    api_key = _load_api_key(args.key_file, args.login)
+    cli = DraftSiteClient(args.url, api_key)
     me = cli.me()
     log(f"Authenticated as {me['login']} (verified={me['verified_slots']}) job={args.job} C={args.concurrency}")
 
@@ -393,6 +444,9 @@ def main() -> None:
                 prog_p,
                 exp_p,
                 cache_p,
+                engine_image_digest=args.engine_image_digest,
+                engine_signature=args.engine_signature,
+                quant_profile=args.quant_profile,
             )
             completed += 1
             if args.max_slots > 0 and completed >= args.max_slots:

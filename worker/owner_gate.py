@@ -101,8 +101,9 @@ def delta_l2_and_cos(a: dict[str, torch.Tensor], b: dict[str, torch.Tensor]) -> 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Owner GPU Held-Out Replay + FLTrust Gate and Aggregator")
-    ap.add_argument("--url", default="https://draft.bertholomus.com")
+    ap.add_argument("--url", default="http://127.0.0.1:8742")
     ap.add_argument("--admin-key-file", required=True)
+    ap.add_argument("--origin-auth-file", default="/tank/projects/draft-site/secrets/origin_auth.secret")
     ap.add_argument("--job", default="glm53-dspine-train")
     ap.add_argument("--round", type=int, default=1)
     ap.add_argument("--data-dir", default="/tank/projects/draft-site/data")
@@ -131,7 +132,8 @@ def main() -> None:
     import gpu_pilots as gp  # noqa: E402
 
     admin_key = Path(args.admin_key_file).read_text(encoding="utf-8").strip()
-    cli = DraftSiteClient(args.url, admin_key)
+    origin_auth = Path(args.origin_auth_file).read_text(encoding="utf-8").strip() if args.origin_auth_file and Path(args.origin_auth_file).is_file() else None
+    cli = DraftSiteClient(args.url, admin_key, origin_auth=origin_auth)
 
     pending = [x for x in cli.admin_get("/api/admin/pending-verifications") if x["job"] == args.job and x["round_num"] == args.round]
     log(f"Found {len(pending)} pending uploaded deltas for {args.job} round {args.round}")

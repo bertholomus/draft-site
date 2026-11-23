@@ -1,0 +1,6 @@
+FROM local/draft-site:harden-candidate
+
+USER root
+COPY requirements-dev.txt /app/requirements-dev.txt
+RUN pip install --no-cache-dir -r /app/requirements-dev.txt
+USER 10001:10001

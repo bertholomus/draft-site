@@ -1,10 +1,14 @@
-"""SQLite WAL state store for jobs, slots, claims, uploads, verifications, rounds, and audit logs."""
+"""SQLite state store for jobs, slots, claims, uploads, verifications, rounds, and audit logs.
+
+Uses journal_mode=DELETE (low-QPS coordinator; avoids -wal/-shm sidecar UID issues) and
+separates read-only queries (db.ro()) from immediate write transactions (db.tx(immediate=True)).
+"""
 from __future__ import annotations
 
 import hashlib
 import hmac
 import json
-import secrets
+import shutil
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -41,14 +45,30 @@ def ensure_dirs() -> None:
         d.mkdir(parents=True, exist_ok=True)
 
 
-def connect() -> sqlite3.Connection:
+def connect(*, set_journal: bool = False) -> sqlite3.Connection:
     conn = sqlite3.connect(str(config.DB_PATH), timeout=30.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
+    if set_journal:
+        conn.execute("PRAGMA journal_mode=DELETE;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.execute("PRAGMA busy_timeout=15000;")
     return conn
+
+
+@contextmanager
+def ro() -> Iterator[sqlite3.Connection]:
+    """Read-only SQLite connection (never takes the write lock)."""
+    conn = connect()
+    try:
+        conn.execute("BEGIN;")
+        yield conn
+    finally:
+        try:
+            conn.execute("ROLLBACK;")
+        except Exception:
+            pass
+        conn.close()
 
 
 @contextmanager
@@ -73,6 +93,7 @@ CREATE TABLE IF NOT EXISTS contributors (
     login TEXT PRIMARY KEY,
     key_hash TEXT NOT NULL UNIQUE,
     is_admin INTEGER NOT NULL DEFAULT 0,
+    is_owner INTEGER NOT NULL DEFAULT 0,
     approved INTEGER NOT NULL DEFAULT 1,
     tiers_json TEXT NOT NULL DEFAULT '[]',
     strikes INTEGER NOT NULL DEFAULT 0,
@@ -138,6 +159,7 @@ CREATE TABLE IF NOT EXISTS slots (
 CREATE INDEX IF NOT EXISTS idx_slots_state ON slots(job, state);
 CREATE INDEX IF NOT EXISTS idx_slots_claim ON slots(claim_id);
 CREATE INDEX IF NOT EXISTS idx_slots_deps ON slots(depends_on_job, depends_on_slot);
+CREATE INDEX IF NOT EXISTS idx_slots_claimed_by ON slots(claimed_by, state);
 
 CREATE TABLE IF NOT EXISTS artifacts (
     artifact_id TEXT PRIMARY KEY,
@@ -170,6 +192,8 @@ CREATE TABLE IF NOT EXISTS upload_sessions (
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_upload_sessions_state ON upload_sessions(state, expires_at);
 
 CREATE TABLE IF NOT EXISTS rounds (
     job TEXT NOT NULL REFERENCES jobs(job) ON DELETE CASCADE,
@@ -204,9 +228,13 @@ CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_events(ts DESC);
 
 def init_db() -> None:
     ensure_dirs()
-    c0 = connect()
+    c0 = connect(set_journal=True)
     try:
         c0.executescript(SCHEMA_SQL)
+        # Idempotent migration for existing DBs lacking contributors.is_owner
+        cols = {r["name"] for r in c0.execute("PRAGMA table_info(contributors)").fetchall()}
+        if "is_owner" not in cols:
+            c0.execute("ALTER TABLE contributors ADD COLUMN is_owner INTEGER NOT NULL DEFAULT 0;")
     finally:
         c0.close()
     with tx(immediate=True) as conn:
@@ -216,31 +244,33 @@ def init_db() -> None:
         if admin_key:
             kh = hash_api_key(admin_key)
             conn.execute(
-                """INSERT INTO contributors (login, key_hash, is_admin, approved, tiers_json, note, created_at)
-                   VALUES ('admin', ?, 1, 1, '["admin"]', 'Bootstrap site operator', ?)
-                   ON CONFLICT(login) DO UPDATE SET key_hash=excluded.key_hash, is_admin=1, approved=1""",
+                """INSERT INTO contributors (login, key_hash, is_admin, is_owner, approved, tiers_json, note, created_at)
+                   VALUES ('admin', ?, 1, 1, 1, '["admin"]', 'Bootstrap site operator', ?)
+                   ON CONFLICT(login) DO UPDATE SET key_hash=excluded.key_hash, is_admin=1, is_owner=1, approved=1""",
                 (kh, now),
             )
-        # Bootstrap closed-pilot internal machine keys (neutral public logins; private host map stays admin-only)
-        tier_defaults = {
-            "bertholomus-w1": (["tier-label", "tier-eval", "tier-cpu"], "private-host: host-1 (NAS CPU worker)"),
-            "bertholomus-w2": (["tier-label", "tier-eval", "tier-cpu"], "private-host: host-2 (macOS workstation)"),
-            "bertholomus-w3": (["tier-train", "tier-eval", "tier-capture"], "private-host: host-3 (96GB Blackwell GPU)"),
-            "bertholomus-w4": (["tier-train", "tier-eval", "tier-label"], "private-host: host-4 (128GB GB10 GPU)"),
-            "bertholomus-qa": (["tier-train", "tier-eval", "tier-label", "tier-capture"], "private-host: internal verification QA"),
-        }
+        # Ensure existing owner logins and admins carry is_owner=1
+        conn.execute("UPDATE contributors SET is_owner=1 WHERE is_admin=1 AND is_owner=0")
+        if config.OWNER_LOGINS:
+            placeholders = ",".join("?" for _ in config.OWNER_LOGINS)
+            conn.execute(
+                f"UPDATE contributors SET is_owner=1 WHERE login IN ({placeholders}) AND is_owner=0",
+                tuple(sorted(config.OWNER_LOGINS)),
+            )
+        # Optional legacy bootstrap (off by default; never overwrites existing rows)
         for login, raw_key in config.load_bootstrap_worker_keys().items():
             if not raw_key:
                 continue
             kh = hash_api_key(raw_key)
-            tiers_list, note = tier_defaults.get(login, (["tier-eval"], "Closed-pilot internal worker"))
-            tiers = json.dumps(tiers_list)
+            is_own = 1 if login in config.OWNER_LOGINS else 0
+            tiers = json.dumps(["tier-label"])
             conn.execute(
-                """INSERT INTO contributors (login, key_hash, is_admin, approved, tiers_json, note, created_at)
-                   VALUES (?, ?, 0, 1, ?, ?, ?)
-                   ON CONFLICT(login) DO UPDATE SET key_hash=excluded.key_hash, tiers_json=excluded.tiers_json, note=excluded.note""",
-                (login, kh, tiers, note, now),
+                """INSERT INTO contributors (login, key_hash, is_admin, is_owner, approved, tiers_json, note, created_at)
+                   VALUES (?, ?, 0, ?, 1, ?, 'Bootstrapped worker', ?)
+                   ON CONFLICT(login) DO NOTHING""",
+                (login, kh, is_own, tiers, now),
             )
+        sweep_expired_claims(conn)
 
 
 def log_audit(
@@ -259,6 +289,56 @@ def log_audit(
     )
 
 
+def sweep_expired_uploads(conn: sqlite3.Connection) -> int:
+    """Expire stale upload sessions and clean abandoned staging dirs/files."""
+    now = utc_ms()
+    verify_stale_cutoff = now - max(config.VERIFY_SUBPROCESS_TIMEOUT_SEC * 2, 300) * 1000
+    rows = conn.execute(
+        """SELECT u.upload_id, u.claim_id, u.state, u.expires_at, u.created_at, s.state AS slot_state, s.claim_id AS slot_claim
+           FROM upload_sessions u
+           LEFT JOIN slots s ON u.job = s.job AND u.slot_id = s.slot_id
+           WHERE u.state IN ('open', 'verifying')"""
+    ).fetchall()
+
+    expired = 0
+    active_ids: set[str] = set()
+    for r in rows:
+        uid = r["upload_id"]
+        claim_dead = (r["slot_state"] != "claimed") or (r["slot_claim"] != r["claim_id"])
+        is_expired = (int(r["expires_at"]) < now) or claim_dead
+        if r["state"] == "verifying":
+            # Only sweep a 'verifying' session if it is well past the verifier timeout
+            is_expired = is_expired and (int(r["created_at"]) < verify_stale_cutoff)
+        if is_expired:
+            conn.execute("UPDATE upload_sessions SET state='expired' WHERE upload_id=?", (uid,))
+            sdir = config.STAGING_DIR / uid
+            if sdir.exists():
+                shutil.rmtree(sdir, ignore_errors=True)
+            assembled = config.STAGING_DIR / f"{uid}_assembled.tmp"
+            assembled.unlink(missing_ok=True)
+            expired += 1
+        else:
+            active_ids.add(uid)
+
+    # Sweep orphaned staging files/directories not tied to any active upload session
+    if config.STAGING_DIR.is_dir():
+        cutoff_sec = time.time() - config.STAGING_ORPHAN_TTL_SEC
+        for child in list(config.STAGING_DIR.iterdir()):
+            name = child.name
+            if name in active_ids or any(name.startswith(aid + "_") for aid in active_ids):
+                continue
+            try:
+                if child.stat().st_mtime < cutoff_sec:
+                    if child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        child.unlink(missing_ok=True)
+                    expired += 1
+            except FileNotFoundError:
+                pass
+    return expired
+
+
 def sweep_expired_claims(conn: sqlite3.Connection) -> int:
     now = utc_ms()
     rows = conn.execute(
@@ -273,16 +353,26 @@ def sweep_expired_claims(conn: sqlite3.Connection) -> int:
             (r["job"], r["slot_id"]),
         )
         log_audit(conn, "system", "claim_expired", "ok", r["job"], r["slot_id"], {"prev_holder": r["claimed_by"]})
+    sweep_expired_uploads(conn)
     return len(rows)
 
 
-def lookup_auth(conn: sqlite3.Connection, raw_token: str | None) -> sqlite3.Row | None:
+def lookup_auth(
+    conn: sqlite3.Connection,
+    raw_token: str | None,
+    *,
+    touch_last_seen: bool = False,
+) -> sqlite3.Row | None:
     if not raw_token:
         return None
     kh = hash_api_key(raw_token)
     row = conn.execute("SELECT * FROM contributors WHERE key_hash=?", (kh,)).fetchone()
     if row is not None and hmac.compare_digest(row["key_hash"], kh):
-        conn.execute("UPDATE contributors SET last_seen_at=? WHERE login=?", (utc_ms(), row["login"]))
+        if touch_last_seen:
+            now = utc_ms()
+            prev = row["last_seen_at"]
+            if prev is None or (now - int(prev)) >= 60_000:
+                conn.execute("UPDATE contributors SET last_seen_at=? WHERE login=?", (now, row["login"]))
         return row
     return None
 
@@ -326,7 +416,7 @@ def trigger_downstream_readiness(
             "ok",
             d["job"],
             d["slot_id"],
-            {"upstream": f"{upstream_job}/{upstream_slot}", "artifact_id": art["artifact_id"]},
+            {"upstream": f"{upstream_job}/{upstream_slot}"},
         )
         opened.append({"job": d["job"], "slot_id": d["slot_id"]})
     return opened

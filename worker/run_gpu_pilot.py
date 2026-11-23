@@ -55,7 +55,7 @@ def run_eval_profile_mxfp8(model, eval_dir: Path, emb_w, head_w_mxfp8, device, c
 
     with torch.no_grad():
         for sp in shard_files:
-            sd = torch.load(str(sp), map_location="cpu", weights_only=False)
+            sd = torch.load(str(sp), map_location="cpu", weights_only=True)
             cat = str(sd.get("category", "unknown"))
             B = model.cfg.block_size
             L = int(sd["seq_len"])
@@ -282,13 +282,13 @@ def main() -> None:
 
         fresh_pts = sorted(cap_out.glob("seq_*.pt"))
         assert fresh_pts, "exlr8_lan_capture produced 0 shards"
-        sd_fresh = torch.load(str(fresh_pts[0]), map_location="cpu", weights_only=False)
+        sd_fresh = torch.load(str(fresh_pts[0]), map_location="cpu", weights_only=True)
 
         # Bit-exact parity check against banked reference eval shard if same sequence
         ref_pt = Path("/work/eval/bit280") / fresh_pts[0].name
         max_tap_diff = 0.0
         if ref_pt.is_file():
-            sd_ref = torch.load(str(ref_pt), map_location="cpu", weights_only=False)
+            sd_ref = torch.load(str(ref_pt), map_location="cpu", weights_only=True)
             max_tap_diff = float((sd_fresh["taps"].float() - sd_ref["taps"].float()).abs().max().item())
             log(f"  Fresh GPU 78-layer capture vs banked ref max_abs_diff={max_tap_diff:.3e}")
 

@@ -249,7 +249,7 @@ def run_eval_profile_mxfp8(model, eval_dir: Path, emb_w, head_w_mxfp8, device, c
     K7 = 7
     with torch.no_grad():
         for sp in shard_files:
-            sd = torch.load(str(sp), map_location="cpu", weights_only=False)
+            sd = torch.load(str(sp), map_location="cpu", weights_only=True)
             cat = str(sd.get("category", "unknown"))
             B = model.cfg.block_size
             L = int(sd["seq_len"])

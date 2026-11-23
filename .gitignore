@@ -3,3 +3,16 @@ __pycache__/
 .DS_Store
 *.tmp
 *.part
+*.bak-*
+.env
+.env.*
+secrets/
+*secret*
+*api_key*
+*_keys.json
+*.key
+*.pem
+label_cache/
+.pytest_cache/
+.venv/
+.venv-*/
