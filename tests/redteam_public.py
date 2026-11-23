@@ -40,7 +40,10 @@ def _raw_http(
     headers: dict[str, str] | None = None,
     body: bytes | None = None,
 ) -> tuple[int, Any, bytes]:
-    req = urllib.request.Request(url, data=body, headers=headers or {}, method=method)
+    hdrs = {"User-Agent": "drs-redteam/1.0"}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
     try:
         with _NO_REDIRECT_OPENER.open(req, timeout=15) as r:
             return r.status, r.headers, r.read()
@@ -56,11 +59,12 @@ def _raw_http_status(url: str, headers: dict[str, str]) -> int:
 def _docker_create_test_session(container: str, login: str) -> tuple[str, str]:
     """Create a disposable session inside the running container (never opens SQLite from host)."""
     py = (
-        "import json, sys; from server import db; "
-        "login = sys.argv[1]; "
-        "with db.tx(immediate=True) as conn: "
-        "  sid, csrf = db.create_session(conn, login); "
-        "print(json.dumps({'sid': sid, 'csrf': csrf}))"
+        "import json, sys\n"
+        "from server import db\n"
+        "login = sys.argv[1]\n"
+        "with db.tx(immediate=True) as conn:\n"
+        "    sid, csrf = db.create_session(conn, login)\n"
+        "print(json.dumps({'sid': sid, 'csrf': csrf}))\n"
     )
     out = subprocess.check_output(
         ["docker", "exec", container, "python3", "-c", py, login],
@@ -277,7 +281,7 @@ def main() -> None:
 
         # 11. S14: CSP header has no 'unsafe-inline' in script-src & no inline onclick
         st_home, hdr_home, body_home = _raw_http(pub_base + "/")
-        csp = hdr_home.get("Content-Security-Policy", "")
+        csp = "; ".join(hdr_home.get_all("Content-Security-Policy") or [])
         record(
             "s14_csp_no_unsafe_inline_script",
             (st_home == 200 and "script-src 'self'" in csp and "script-src 'self' 'unsafe-inline'" not in csp and b"onclick=" not in body_home),
@@ -362,15 +366,16 @@ def main() -> None:
             # 13a. Pending + XSS user cannot mint keys, sees escaped /waiting page, blocked from /admin
             _docker_exec_py(
                 args.docker_container,
-                "import sys; from server import db; "
-                "login = sys.argv[1]; "
-                "with db.tx(immediate=True) as conn: "
-                "  conn.execute('DELETE FROM contributors WHERE login=?', (login,)); "
-                "  conn.execute("
-                "    \"INSERT INTO contributors (login, key_hash, is_admin, is_owner, approved, denied, tiers_json, strikes, quarantined, note, github_id, github_login, github_name, created_at) "
-                "     VALUES (?, ?, 0, 0, 0, 0, '[\\\"tier-label\\\"]', 0, 0, 'redteam pending', 999999001, ?, ?, ?)\", "
-                "    (login, db.no_key_sentinel(), 'xss-user', '<script>alert(1)</script><img src=x onerror=1>', db.utc_ms())"
-                "  )",
+                "import sys\n"
+                "from server import db\n"
+                "login = sys.argv[1]\n"
+                "with db.tx(immediate=True) as conn:\n"
+                "    conn.execute('DELETE FROM contributors WHERE login=?', (login,))\n"
+                "    conn.execute(\n"
+                "        \"INSERT INTO contributors (login, key_hash, is_admin, is_owner, approved, denied, tiers_json, strikes, quarantined, note, github_id, github_login, github_name, created_at) \"\n"
+                "        \"VALUES (?, ?, 0, 0, 0, 0, '[\\\"tier-label\\\"]', 0, 0, 'redteam pending', 999999001, ?, ?, ?)\",\n"
+                "        (login, db.no_key_sentinel(), 'xss-user', '<script>alert(1)</script><img src=x onerror=1>', db.utc_ms()),\n"
+                "    )\n",
                 args.pending_login,
             )
             p_sid, p_csrf = _docker_create_test_session(args.docker_container, args.pending_login)
@@ -542,9 +547,10 @@ def main() -> None:
             try:
                 _docker_exec_py(
                     args.docker_container,
-                    "import sys; from server import db; "
-                    "with db.tx(immediate=True) as conn: "
-                    "  conn.execute('DELETE FROM contributors WHERE login=?', (sys.argv[1],))",
+                    "import sys\n"
+                    "from server import db\n"
+                    "with db.tx(immediate=True) as conn:\n"
+                    "    conn.execute('DELETE FROM contributors WHERE login=?', (sys.argv[1],))\n",
                     args.pending_login,
                 )
             except Exception:
