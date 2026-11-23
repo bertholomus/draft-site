@@ -2,6 +2,12 @@
 
 Hardened coordination server and external label worker for GLM-5.3 DSpine B=16 drafter data generation, modelled on [Kindling AI's exlr8 quant site](https://quant.kindlingai.dev/).
 
+## Start here
+
+- **Want to contribute labels?** Read [CONTRIBUTING.md](./CONTRIBUTING.md): what the site is, what you need, setup, first test run, checks, rules and troubleshooting.
+- **Using an AI coding agent?** Point it at [AGENTS.md](./AGENTS.md): the same procedure as exact steps, checks and hard rules.
+- **Protocol reference:** [LABELS.md](./LABELS.md): request format, row schema, pass bars.
+
 ## Trust Model & Scope
 - **External contributors (`drafter-label` only):** Non-owner accounts can claim only `drafter-label` slots, subject to tier checks, a per-login active claim cap (`2`), claim-bound artifact downloads, and automatic quarantine at `3` strikes.
 - **Owner-side label verification:** Every non-trusted label upload passes Phase-A structural & SHA-256 verification in an isolated bounded worker subprocess (`server/verify_worker.py`) and waits at `state="uploaded"` (`verify_status="pending_label_gate"`). An owner-side daemon (`worker/label_verify_gate.py`) then teacher-forces an unguessable HMAC-sampled set of `8 × 10 = 80` token probes against the reference GLM-5.3 lane (`>=85%` top-1, `>=96%` top-5, `>=50%` per prompt; canary target `>=92%` top-1 / `>=99%` top-5) before marking the slot `verified`.
