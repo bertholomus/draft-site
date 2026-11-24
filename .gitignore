@@ -16,3 +16,4 @@ label_cache/
 .pytest_cache/
 .venv/
 .venv-*/
+.hermes/
