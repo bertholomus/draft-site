@@ -1,4 +1,4 @@
-"""Web UI for draft.bertholomus.com — hardened CSP (no inline scripts), GitHub OAuth login, self-service API keys, and owner admin view."""
+"""Web UI for draft.bertholomus.com — Campfire-aligned vocabulary, hardened CSP (no inline scripts), GitHub OAuth login, self-service API keys, and owner admin view."""
 from __future__ import annotations
 
 import html
@@ -12,7 +12,7 @@ COMMON_STYLE = r"""
   --rim: inset 0 1px 0 rgb(255 246 227 / 0.05);
   --lift: 0 1px 0 rgb(0 0 0 / 0.35), 0 18px 40px -22px rgb(0 0 0 / 0.8);
   --code-bg: #0E0C09; --good: #4CD97B; --bad: #FF5C7A;
-  --notready: #29241D; --open: #5E5040; --claimed: #FFC24A; --uploaded: #E5A030; --verified: #FF6B1A; --rejected: #FF5C7A; --disabled: #3B3229;
+  --notready: #29241D; --closed: #473E33; --open: #5E5040; --claimed: #FFC24A; --uploaded: #E5A030; --verified: #FF6B1A; --rejected: #FF5C7A; --disabled: #3B3229;
   --mine: #7CC4FF;
   --font-display: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -25,7 +25,7 @@ COMMON_STYLE = r"""
   --rim: inset 0 1px 0 rgb(255 255 255 / 0.7);
   --lift: 0 1px 2px rgb(22 19 15 / 0.06), 0 14px 32px -18px rgb(22 19 15 / 0.22);
   --code-bg: #16130F; --good: #16803C; --bad: #C81E4A;
-  --notready: #EAE3D7; --open: #C9B391; --claimed: #FFB020; --uploaded: #D97706; --verified: #E8590C; --rejected: #C81E4A; --disabled: #DCCFB9;
+  --notready: #EAE3D7; --closed: #D2C7B5; --open: #C9B391; --claimed: #FFB020; --uploaded: #D97706; --verified: #E8590C; --rejected: #C81E4A; --disabled: #DCCFB9;
   --mine: #0B6BCB;
 }
 * { box-sizing: border-box; }
@@ -128,7 +128,7 @@ header.top {
   cursor: pointer; transition: border-color 0.15s;
 }
 .job-card:hover, .job-card.selected { border-color: var(--accent); }
-.job-card .kind { font: 600 11px var(--font-mono); color: var(--accent-text); text-transform: uppercase; }
+.job-card .kind { font: 600 11px var(--font-mono); color: var(--accent-text); text-transform: uppercase; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .job-card .title { font-weight: 600; margin: 4px 0 6px; font-size: 15px; }
 .bar { height: 8px; border-radius: 999px; background: var(--notready); overflow: hidden; display: flex; margin: 8px 0; }
 .bar > span { display: block; height: 100%; }
@@ -144,7 +144,9 @@ header.top {
 .slot-cell.st-uploaded { border-left: 4px solid var(--uploaded); }
 .slot-cell.st-claimed { border-left: 4px solid var(--claimed); }
 .slot-cell.st-open { border-left: 4px solid var(--open); }
+.slot-cell.st-closed { border-left: 4px solid var(--closed); opacity: 0.85; }
 .slot-cell.st-not_ready { border-left: 4px solid var(--notready); opacity: 0.72; }
+.slot-cell.st-disabled { border-left: 4px solid var(--disabled); opacity: 0.65; }
 .slot-cell.st-rejected { border-left: 4px solid var(--rejected); }
 .slot-cell .sid { font-weight: 600; color: var(--fg); word-break: break-all; }
 .slot-cell .st { text-transform: uppercase; font-size: 11px; margin-top: 3px; }
@@ -165,15 +167,22 @@ footer { margin-top: 34px; padding-top: 18px; border-top: 1px solid var(--line);
 """
 
 
-def render_index_html() -> str:
+def render_index_html(*, initial_job: str | None = None) -> str:
+    esc_init = html.escape(initial_job or "", quote=True)
+    init_attr = f' data-initial-job="{esc_init}"' if initial_job else ""
+    page_title = (
+        f"{esc_init} · draft.bertholomus.com" if initial_job else "draft.bertholomus.com · Volunteer Drafter Label Projects"
+    )
     return (
         """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>draft.bertholomus.com · GLM-5.3 Drafter Label Coordinator</title>
-<meta name="description" content="Trusted-contributor label coordinator for GLM-5.3 DSpine B=16 drafter training.">
+<title>"""
+        + page_title
+        + """</title>
+<meta name="description" content="Campfire-compatible volunteer drafter-label project coordinator for GLM-5.3.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -182,18 +191,21 @@ def render_index_html() -> str:
         + """</style>
 <script src="/static/app.js" defer></script>
 </head>
-<body data-page="index">
+<body data-page="index\""""
+        + init_attr
+        + """>
 <div class="wrap">
   <header class="top">
     <div class="brand">
-      <div class="logo">DS</div>
+      <div class="logo">DR</div>
       <div>
-        <h1>draft.bertholomus.com</h1>
-        <div class="sub">Trusted-Contributor Label Coordinator · GLM-5.3 DSpine B=16</div>
+        <h1><a href="/" style="color:inherit;text-decoration:none">draft.bertholomus.com</a></h1>
+        <div class="sub">Campfire-Compatible Drafter Label Coordinator · GLM-5.3</div>
       </div>
     </div>
     <div class="top-actions">
-      <span class="pill"><span class="dot"></span><span id="statusText">Trusted Labels · Hardened</span></span>
+      <a class="btn" href="/skill.md">/skill.md</a>
+      <span class="pill"><span class="dot"></span><span id="statusText">Campfire-Aligned · Verified Labels</span></span>
       <span id="authActions"><a class="btn btn-accent" href="/auth/login">Log in with GitHub</a></span>
       <button class="btn" id="refreshBtn" type="button">Refresh</button>
       <button class="btn" id="themeBtn" type="button">Theme</button>
@@ -201,53 +213,48 @@ def render_index_html() -> str:
   </header>
 
   <section class="hero">
-    <h2>Owner-Verified Label Coordination for GLM-5.3 DSpine</h2>
+    <h2>Volunteer Drafter Projects for GLM-5.3</h2>
     <p>
-      Modelled on <a href="https://quant.kindlingai.dev/" target="_blank" rel="noreferrer">Kindling AI's exlr8 quant site</a>
-      (GitHub sign-in, self-service API keys, jobs, slot grids, atomic claims, readiness gating, verified uploads, contributor credit),
-      this coordinator onboards approved external contributors for <strong><code>drafter-label</code> slots only</strong> on
-      <code>kindlingai/glm-5.3-exlr8-k2-k3-k4@9e25c28a</code>. Sign in with GitHub to create, rotate, and revoke your own worker key;
-      every external label upload waits at <code>uploaded</code> until an owner-side gate teacher-forces 8&times;10 = 80 secret token probes
-      against the reference GLM-5.3 lane. Training, evaluation, capture, and packing slots remain owner-only.
+      Built to match <a href="https://campfire.kindlingai.dev/" target="_blank" rel="noreferrer">Campfire by Kindling AI</a>
+      (projects, slot states, GitHub sign-in, self-service API keys, atomic claims, readiness gating, and
+      <a href="/skill.md">/skill.md</a> agent onboarding) so contributors can transition cleanly when drafter projects
+      are hosted directly on Campfire. Approved external contributors claim <strong><code>drafter-label</code> slots</strong>
+      on <code>kindlingai/glm-5.3-exlr8-k2-k3-k4@9e25c28a</code>; every upload passes a fast structural/SHA-256 check
+      and waits at <code>uploaded</code> until an owner-side gate runs an unguessable 8&times;10 = 80 teacher-forced
+      spot check against the reference GLM-5.3 lane.
     </p>
     <div class="hero-grid">
       <div class="stage-card">
-        <div class="k">External · drafter-label</div>
-        <div class="t">Same-Model Greedy Responses</div>
-        <div class="d">Pre-tokenized permissive prompts (<code>/v1/completions</code> with <code>prompt_ids</code>). Held at <code>uploaded</code> until owner spot-rescoring passes (&ge;85% top-1, &ge;96% top-5, &ge;50% per prompt; canary target &ge;92% / &ge;99%). Relabeled with prefix masking in training.</div>
+        <div class="k">Live · drafter-label</div>
+        <div class="t">Same-Model Greedy Labels</div>
+        <div class="d">Pre-tokenized permissive public prompts via local <code>/v1/completions</code>. Held at <code>uploaded</code> until owner spot-rescoring passes (&ge;85% top-1, &ge;96% top-5, &ge;50% per prompt; canary target &ge;92% / &ge;99%).</div>
       </div>
       <div class="stage-card">
-        <div class="k">Owner-Only · drafter-train</div>
-        <div class="t">Local Capture + SparseLoCo</div>
-        <div class="d">Owner fleet only. Local scratch capture (0 B taps uploaded), safe <code>.safetensors</code> deltas gated by owner held-out replay before aggregation.</div>
+        <div class="k">Planned · drafter-eval</div>
+        <div class="t">Cross-Profile Eval Matrix</div>
+        <div class="d">Small deterministic JSON eval summaries verified by 2-contributor distinct-login duplicate quorum.</div>
       </div>
       <div class="stage-card">
-        <div class="k">Owner-Only · drafter-eval</div>
-        <div class="t">Offline Acceptance Matrix</div>
-        <div class="d">Owner fleet only. Offline MXFP8 replay across the 5 evaluated anchor profiles (<code>bit200, bit240, bit280, bit322, bit400</code>).</div>
-      </div>
-      <div class="stage-card">
-        <div class="k">Owner-Only · drafter-capture &amp; pack</div>
-        <div class="t">Archive &amp; TP4 Pack</div>
-        <div class="d">Owner fleet only. 4-tap (<code>L33/47/61/75</code>) INT8+zstd archive shards and deterministic CPU TP4 packing manifests.</div>
+        <div class="k">Optional · drafter-capture</div>
+        <div class="t">Compressed Tap Shards</div>
+        <div class="d">Optional chunked <code>.safetensors</code> capture uploads gated by zero-pickle header, shape, and finiteness checks.</div>
       </div>
     </div>
   </section>
 
   <div class="tabs">
-    <button class="tab active" data-tab="board" type="button">Job Board &amp; Slot Grid</button>
+    <button class="tab active" data-tab="board" type="button">Projects &amp; Slot Grid</button>
     <button class="tab" data-tab="keys" type="button">API Keys</button>
     <button class="tab" data-tab="admin" id="adminTabBtn" type="button" style="display:none">Admin · Access Requests</button>
-    <button class="tab" data-tab="matrix" type="button">Eval Matrix &amp; Rounds</button>
     <button class="tab" data-tab="contributors" type="button">Contributors &amp; Audit</button>
-    <button class="tab" data-tab="api" type="button">API &amp; Label Worker</button>
+    <button class="tab" data-tab="api" type="button">API &amp; /skill.md</button>
   </div>
 
-  <!-- TAB 1: JOB BOARD & SLOT GRID -->
+  <!-- TAB 1: PROJECTS & SLOT GRID -->
   <div id="tab-board">
     <section class="panel">
       <div class="head">
-        <h3>Active Jobs</h3>
+        <h3>Active Projects</h3>
         <div class="meta" id="jobsMeta">Loading…</div>
       </div>
       <div class="body">
@@ -258,7 +265,7 @@ def render_index_html() -> str:
     <section class="panel">
       <div class="head">
         <h3 id="gridTitle">Slot Grid</h3>
-        <div class="meta" id="gridMeta">Select a job above</div>
+        <div class="meta" id="gridMeta">Select a project above</div>
       </div>
       <div class="body">
         <div class="legend">
@@ -266,7 +273,9 @@ def render_index_html() -> str:
           <span><i class="sw" style="background:var(--uploaded)"></i>uploaded (pending owner gate)</span>
           <span><i class="sw" style="background:var(--claimed)"></i>claimed</span>
           <span><i class="sw" style="background:var(--open)"></i>open</span>
-          <span><i class="sw" style="background:var(--notready)"></i>not_ready (gated)</span>
+          <span><i class="sw" style="background:var(--closed)"></i>closed (inputs up, claims off)</span>
+          <span><i class="sw" style="background:var(--disabled)"></i>disabled</span>
+          <span><i class="sw" style="background:var(--notready)"></i>not ready</span>
           <span><i class="sw" style="background:var(--rejected)"></i>rejected</span>
         </div>
         <div class="slot-grid" id="slotGrid"></div>
@@ -319,25 +328,6 @@ def render_index_html() -> str:
     </section>
   </div>
 
-  <!-- TAB 2: EVAL MATRIX & TRAINING ROUNDS -->
-  <div id="tab-matrix" style="display:none">
-    <section class="panel">
-      <div class="head">
-        <h3>5-Profile Offline Acceptance Matrix (MXFP8 B16 / B8 &tau;)</h3>
-        <div class="meta"><code>drafter-eval</code> owner-verified slots · target <code>kindlingai/glm-5.3-exlr8-k2-k3-k4@9e25c28a</code></div>
-      </div>
-      <div class="body" id="evalMatrixBody">Loading…</div>
-    </section>
-
-    <section class="panel">
-      <div class="head">
-        <h3>Training Rounds &amp; Offline Champion Reference</h3>
-        <div class="meta"><code>drafter-train</code> aggregated results vs champion <code>v5-s2-w5@500</code></div>
-      </div>
-      <div class="body" id="roundsBody">Loading…</div>
-    </section>
-  </div>
-
   <!-- TAB 3: CONTRIBUTORS & AUDIT LOG -->
   <div id="tab-contributors" style="display:none">
     <div class="cols-2">
@@ -362,27 +352,29 @@ def render_index_html() -> str:
   <div id="tab-api" style="display:none">
     <section class="panel">
       <div class="head">
-        <h3>API Reference &amp; External Label Worker</h3>
-        <div class="meta">All <code>/api/*</code> requests require <code>X-Quant: 1</code></div>
+        <h3>Campfire-Compatible API &amp; Label Worker</h3>
+        <div class="meta">All <code>/api/*</code> requests require <code>X-Quant: 1</code> · Agent setup: <a href="/skill.md">/skill.md</a></div>
       </div>
       <div class="body">
         <table>
           <thead><tr><th>Endpoint</th><th>Method</th><th>Auth</th><th>Purpose</th></tr></thead>
           <tbody>
+            <tr><td><code>/skill.md</code></td><td>GET</td><td>Public</td><td>Campfire-format agent onboarding guide for <code>drafter-label</code> workers</td></tr>
+            <tr><td><code>/jobs/&lt;job&gt;</code></td><td>GET</td><td>Public</td><td>Direct project view URL (matches Campfire's <code>/jobs/&lt;job&gt;</code> route)</td></tr>
             <tr><td><code>/auth/login</code> &rarr; <code>/auth/callback</code></td><td>GET</td><td>Browser</td><td>Log in with GitHub (read-only identity, allow-list gated)</td></tr>
             <tr><td><code>/api/keys</code>, <code>.../rotate</code>, <code>DELETE /api/keys/&lt;id&gt;</code></td><td>GET/POST/DELETE</td><td>Session + CSRF</td><td>Self-service worker API keys (max 2 live keys, shown once)</td></tr>
-            <tr><td><code>/api/jobs</code></td><td>GET</td><td>Public</td><td>List jobs, slot counts, verified totals, release info</td></tr>
-            <tr><td><code>/api/grid?job=&lt;job&gt;&amp;offset=0&amp;limit=500</code></td><td>GET</td><td>Public (+optional Bearer)</td><td>Paginated slot grid, readiness gating, eval matrix, rounds</td></tr>
-            <tr><td><code>/api/runners</code> (alias <code>/api/encoders</code>)</td><td>GET</td><td>Public</td><td>Accepted worker runner IDs &amp; container digests</td></tr>
+            <tr><td><code>/api/jobs[?kind=...]</code></td><td>GET</td><td>Public</td><td>List projects with Campfire-aligned fields (<code>kind</code>, <code>open</code>, <code>closed</code>, <code>claimed</code>, <code>uploaded</code>, <code>verified</code>, <code>weights</code>)</td></tr>
+            <tr><td><code>/api/grid?job=&lt;job&gt;&amp;offset=0&amp;limit=500</code></td><td>GET</td><td>Public (+optional Bearer)</td><td>Paginated slot grid and readiness state</td></tr>
+            <tr><td><code>/api/runners[?kind=...]</code> (alias <code>/api/encoders</code>)</td><td>GET</td><td>Public</td><td>Accepted worker runner IDs &amp; digests</td></tr>
             <tr><td><code>/api/contributors</code></td><td>GET</td><td>Public</td><td>Verified contributor credit &amp; per-kind slot breakdown</td></tr>
             <tr><td><code>/api/audit</code></td><td>GET</td><td>Public</td><td>Redacted recent claim, verification, and rejection events</td></tr>
-            <tr><td><code>/api/me</code></td><td>GET</td><td>Bearer key</td><td>Authenticated login, allowed kinds, claim cap, tiers, strikes</td></tr>
-            <tr><td><code>/api/claims</code></td><td>GET / POST</td><td>Bearer key</td><td>List or claim open slots (non-owners: <code>drafter-label</code> only, max 2 active claims)</td></tr>
-            <tr><td><code>/api/claims/&lt;job&gt;/&lt;slot_id&gt;</code></td><td>DELETE</td><td>Bearer key</td><td>Release an active claim cleanly</td></tr>
+            <tr><td><code>/api/me</code></td><td>GET</td><td>Bearer key</td><td>Authenticated login, role, allowed kinds, claim cap, tiers, strikes</td></tr>
+            <tr><td><code>/api/claims[?kind=...]</code></td><td>GET / POST / DELETE</td><td>Bearer key</td><td>List, claim, or release all active claims (external: <code>drafter-label</code> only, max 2 active)</td></tr>
+            <tr><td><code>/api/claims/&lt;job&gt;/&lt;slot_id&gt;</code></td><td>DELETE</td><td>Bearer key</td><td>Release one active claim cleanly</td></tr>
             <tr><td><code>/api/artifacts/&lt;artifact_id&gt;</code></td><td>GET</td><td>Bearer key</td><td>Download input shards bound strictly to caller's active claim (<code>X-SHA256</code>)</td></tr>
             <tr><td><code>/api/uploads/direct/&lt;claim_id&gt;</code></td><td>POST</td><td>Bearer key</td><td>Direct upload (&le;12 MiB, mandatory <code>X-Content-SHA256</code>, isolated Phase-A verification)</td></tr>
             <tr><td><code>/api/uploads/init</code> &rarr; <code>PUT .../chunk/{i}</code> &rarr; <code>POST .../complete</code></td><td>POST/PUT</td><td>Bearer key</td><td>Chunked upload (&ge;256 KiB chunk floor, exact chunk sizes, mandatory SHA-256)</td></tr>
-            <tr><td><code>/api/admin/*</code></td><td>GET / POST</td><td>Admin Bearer</td><td>Operator credential for job/runner management, access approvals &amp; owner verification verdicts</td></tr>
+            <tr><td><code>/api/admin/*</code></td><td>GET / POST</td><td>Admin Bearer</td><td>Operator credential for project/runner management, access approvals &amp; owner verification verdicts</td></tr>
           </tbody>
         </table>
 <pre># 1. Click "Log in with GitHub" above, open the "API Keys" tab, and create a key.
@@ -391,7 +383,7 @@ mkdir -p ~/.config/draft-site
 printf '%s\n' 'drs_wrk_PASTE_YOUR_KEY_HERE' &gt; ~/.config/draft-site/key
 chmod 600 ~/.config/draft-site/key
 
-# 3. Run one test slot first (see CONTRIBUTING.md and LABELS.md):
+# 3. Run one test slot first (see /skill.md, CONTRIBUTING.md, and LABELS.md):
 python3 worker/label_worker.py \
   --url https://draft.bertholomus.com \
   --key-file ~/.config/draft-site/key \
@@ -410,9 +402,8 @@ python3 worker/label_worker.py \
     <div>
       <strong>Attribution &amp; Rights:</strong> Target model release
       <code>kindlingai/glm-5.3-exlr8-k2-k3-k4@9e25c28a</code> by <strong>Kindling AI</strong> (Matt Mastracci <code>@mmastrac</code>, Chuck <code>@ck2084</code>, Steve <code>@coffeedev</code>).
-      Base model GLM-5.3 by Z.ai. DSpine architecture by Tencent (Apache-2.0); warm-start from
-      <code>incoai/GLM-5.3-DFlash2@8f02251d</code> (Apache-2.0, <a href="/NOTICE">NOTICE</a> &amp; <a href="/LICENSE">LICENSE</a>).
-      Prompts from public permissive sources (Apache-2.0 / MIT / PSF); zero private traffic; zero CC BY-NC-ND weights.
+      Base model GLM-5.3 by Z.ai. Coordinator &amp; label worker licensed under Apache-2.0 (<a href="/NOTICE">NOTICE</a> &amp; <a href="/LICENSE">LICENSE</a>).
+      Prompts come from public permissive sources (Apache-2.0 / MIT / PSF); zero private traffic.
       Uploaded artifacts are untrusted, verified in isolated non-executing worker processes without pickle, stored outside web root, and never loaded onto serving lanes.
     </div>
   </footer>
@@ -480,7 +471,7 @@ def render_waiting_html(
         + msg
         + """</p>
       <div class="row-actions" style="margin-top:18px">
-        <a class="btn" href="/">Back to status board</a>
+        <a class="btn" href="/">Back to projects</a>
         <form method="post" action="/auth/logout" style="margin:0">
           <input type="hidden" name="csrf_token" value=\""""
         + esc_csrf
@@ -517,14 +508,14 @@ def render_admin_html() -> str:
 <div class="wrap">
   <header class="top">
     <div class="brand">
-      <div class="logo">DS</div>
+      <div class="logo">DR</div>
       <div>
         <h1>draft.bertholomus.com · Admin</h1>
         <div class="sub">Owner Allow-List &amp; Pending GitHub Requests</div>
       </div>
     </div>
     <div class="top-actions">
-      <a class="btn" href="/">Status Board</a>
+      <a class="btn" href="/">Projects</a>
       <span id="authActions"></span>
       <button class="btn" id="refreshBtn" type="button">Refresh</button>
       <button class="btn" id="themeBtn" type="button">Theme</button>
@@ -579,7 +570,7 @@ def render_auth_error_html(title: str, message: str) -> str:
         + """</p>
       <div class="row-actions" style="margin-top:18px">
         <a class="btn btn-accent" href="/auth/login">Try Log in with GitHub again</a>
-        <a class="btn" href="/">Back to status board</a>
+        <a class="btn" href="/">Back to projects</a>
       </div>
     </div>
   </section>

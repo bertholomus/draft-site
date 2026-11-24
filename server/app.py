@@ -23,11 +23,11 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 
-from server import config, db, ui
+from server import config, db, skill, ui
 
 SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
-ALLOWED_READY_STATES = frozenset(("not_ready", "open", "disabled", "rejected"))
+ALLOWED_READY_STATES = frozenset(("not_ready", "closed", "open", "disabled", "rejected"))
 PUBLIC_AUDIT_REDACT_KEYS = frozenset(
     (
         "host_tag",
@@ -439,7 +439,7 @@ async def security_and_origin_middleware(request: Request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
     p = request.url.path
-    if p.startswith("/api/") or p.startswith("/auth/") or p in ("/", "/waiting", "/admin"):
+    if p.startswith("/api/") or p.startswith("/auth/") or p.startswith("/jobs/") or p in ("/", "/waiting", "/admin", "/skill.md"):
         response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -481,10 +481,32 @@ def static_app_js() -> FileResponse:
     )
 
 
+@app.get("/skill.md", response_class=PlainTextResponse)
+def skill_md_page() -> PlainTextResponse:
+    return PlainTextResponse(
+        content=skill.render_skill_md(config.PUBLIC_URL),
+        media_type="text/markdown; charset=utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @app.get("/", response_class=HTMLResponse)
 def index_page() -> HTMLResponse:
     return HTMLResponse(
         content=ui.render_index_html(),
+        headers={"Cache-Control": "no-store", "Content-Security-Policy": CSP_STRICT},
+    )
+
+
+@app.get("/jobs/{job}", response_class=HTMLResponse)
+def job_page(job: str) -> Response:
+    _validate_id(job, "job")
+    with db.ro() as conn:
+        row = conn.execute("SELECT job FROM jobs WHERE job=?", (job,)).fetchone()
+        if row is None:
+            return JSONResponse(status_code=404, content={"detail": f"no job {job}", "error": f"no job {job}"})
+    return HTMLResponse(
+        content=ui.render_index_html(initial_job=job),
         headers={"Cache-Control": "no-store", "Content-Security-Policy": CSP_STRICT},
     )
 
@@ -874,20 +896,29 @@ def revoke_my_key(request: Request, key_id: str) -> dict[str, Any]:
 
 @app.get("/api/encoders")
 @app.get("/api/runners")
-def list_runners(request: Request) -> list[dict[str, Any]]:
+def list_runners(request: Request, kind: str | None = None) -> list[dict[str, Any]]:
     _require_x_quant(request)
     with db.ro() as conn:
-        rows = conn.execute(
-            "SELECT commit_id, kind, image_digest, note, added_at FROM runners WHERE active=1 ORDER BY added_at ASC"
-        ).fetchall()
+        if kind:
+            rows = conn.execute(
+                "SELECT commit_id, kind, image_digest, note, added_at FROM runners WHERE active=1 AND (kind='all' OR kind=?) ORDER BY added_at ASC",
+                (kind,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT commit_id, kind, image_digest, note, added_at FROM runners WHERE active=1 ORDER BY added_at ASC"
+            ).fetchall()
         return [dict(r) for r in rows]
 
 
 @app.get("/api/jobs")
-def list_jobs(request: Request) -> list[dict[str, Any]]:
+def list_jobs(request: Request, kind: str | None = None) -> list[dict[str, Any]]:
     _require_x_quant(request)
     with db.ro() as conn:
-        jobs = conn.execute("SELECT * FROM jobs ORDER BY created_at ASC").fetchall()
+        if kind:
+            jobs = conn.execute("SELECT * FROM jobs WHERE job_kind=? ORDER BY created_at ASC", (kind,)).fetchall()
+        else:
+            jobs = conn.execute("SELECT * FROM jobs ORDER BY created_at ASC").fetchall()
         agg_rows = conn.execute(
             """SELECT job, state, COUNT(*) AS n, SUM(harvested) AS harv, MAX(uploaded_at) AS last_up
                FROM slots GROUP BY job, state"""
@@ -919,26 +950,34 @@ def list_jobs(request: Request) -> list[dict[str, Any]]:
                 {
                     "job": jb,
                     "title": j["title"],
+                    "kind": j["job_kind"],
                     "job_kind": j["job_kind"],
                     "model": j["model"],
                     "version": j["version"],
+                    "layers": 0,
+                    "experts": 0,
                     "active_round": j["active_round"],
                     "slots": total_slots,
                     "uploaded": counts.get("uploaded", 0) + counts.get("verified", 0),
                     "verified": counts.get("verified", 0),
                     "pending_verify": counts.get("uploaded", 0),
                     "claimed": counts.get("claimed", 0),
+                    "disabled": counts.get("disabled", 0),
                     "open": counts.get("open", 0),
+                    "closed": counts.get("closed", 0),
                     "not_ready": counts.get("not_ready", 0),
                     "rejected": counts.get("rejected", 0),
-                    "disabled": counts.get("disabled", 0),
                     "harvested": by_job_harv.get(jb, 0),
+                    "ready_layers": 0,
+                    "done_layers": 0,
                     "contributors": by_job_contribs.get(jb, 0),
                     "last_upload": by_job_last.get(jb),
                     "weights": {
                         "hf": j["release_repo"],
                         "revision": j["release_revision"],
+                        "id": None,
                     },
+                    "codebooks": [],
                     "config": cfg,
                 }
             )
@@ -1049,10 +1088,16 @@ def get_grid(request: Request, job: str, offset: int = 0, limit: int = 500) -> d
         return {
             "job": j["job"],
             "jobs": all_jobs,
+            "kind": j["job_kind"],
             "job_kind": j["job_kind"],
             "model": j["model"],
             "release": j["release_repo"],
             "revision": j["release_revision"],
+            "weights": {
+                "hf": j["release_repo"],
+                "revision": j["release_revision"],
+                "id": None,
+            },
             "title": j["title"],
             "active_round": j["active_round"],
             "axes": {"rows": rows_axis, "cols": cols_axis},
@@ -1174,6 +1219,7 @@ def get_me(request: Request) -> dict[str, Any]:
             "denied": bool(user["denied"]),
             "admin": bool(user["is_admin"]),
             "owner": is_own,
+            "role": "owner" if is_own else ("pending" if not bool(user["approved"]) else "contributor"),
             "quarantined": bool(user["quarantined"]),
             "tiers": json.loads(user["tiers_json"] or "[]"),
             "allowed_kinds": sorted(_allowed_kinds_for_user(user)),
@@ -1209,6 +1255,7 @@ def _format_claim_response(slot: sqlite3.Row, job_row: sqlite3.Row, *, base_url:
     return {
         "claim_id": slot["claim_id"],
         "job": slot["job"],
+        "kind": job_row["job_kind"],
         "job_kind": job_row["job_kind"],
         "slot_id": slot["slot_id"],
         "row_key": slot["row_key"],
@@ -1218,6 +1265,7 @@ def _format_claim_response(slot: sqlite3.Row, job_row: sqlite3.Row, *, base_url:
         "expires_at": slot["expires_at"],
         "expires_utc": db.utc_iso(slot["expires_at"]),
         "release": {"hf": job_row["release_repo"], "revision": job_row["release_revision"]},
+        "weights": {"hf": job_row["release_repo"], "revision": job_row["release_revision"], "id": None},
         "inputs": inputs_out,
         "plan": json.loads(slot["plan_json"] or "{}"),
         "upload": {
@@ -1232,7 +1280,7 @@ def _format_claim_response(slot: sqlite3.Row, job_row: sqlite3.Row, *, base_url:
 
 
 @app.get("/api/claims")
-def list_my_claims(request: Request) -> list[dict[str, Any]]:
+def list_my_claims(request: Request, kind: str | None = None) -> list[dict[str, Any]]:
     _require_x_quant(request)
     burl = _base_url_for_request(request)
     with db.tx(immediate=True) as conn:
@@ -1245,6 +1293,8 @@ def list_my_claims(request: Request) -> list[dict[str, Any]]:
         out = []
         for s in rows:
             j = conn.execute("SELECT * FROM jobs WHERE job=?", (s["job"],)).fetchone()
+            if kind and str(j["job_kind"]) != kind:
+                continue
             out.append(_format_claim_response(s, j, base_url=burl))
         return out
 
@@ -1272,11 +1322,16 @@ async def create_claim(request: Request) -> JSONResponse:
         raise HTTPException(status_code=400, detail="fresh request id required")
     req_job = body.get("job")
     req_slot = body.get("slot_id")
+    req_kind = str(body.get("kind") or "").strip() or None
     req_profile = body.get("profile")
     req_round = body.get("round")
     host_tag = str(body.get("host_tag") or "").strip()[:64]
     capabilities = body.get("capabilities") or body.get("codebooks") or []
 
+    if req_kind == "encode":
+        raise HTTPException(status_code=400, detail="encode jobs are served on campfire.kindlingai.dev, not this coordinator")
+    if req_kind is not None and req_kind not in config.KIND_TO_TIER:
+        raise HTTPException(status_code=400, detail=f"unsupported job kind '{req_kind}'")
     if req_job is not None:
         _validate_id(str(req_job), "job")
     if req_slot is not None:
@@ -1305,6 +1360,8 @@ async def create_claim(request: Request) -> JSONResponse:
             if jcheck is None:
                 raise HTTPException(status_code=404, detail=f"job '{req_job}' not found")
             jkind = str(jcheck["job_kind"])
+            if req_kind and jkind != req_kind:
+                raise HTTPException(status_code=400, detail=f"job '{req_job}' is kind '{jkind}', not '{req_kind}'")
             if not is_own and jkind not in config.NON_OWNER_ALLOWED_KINDS:
                 raise HTTPException(status_code=403, detail=f"non-owner contributors may only claim {', '.join(sorted(config.NON_OWNER_ALLOWED_KINDS))} slots")
             if jkind not in allowed_kinds:
@@ -1330,7 +1387,12 @@ async def create_claim(request: Request) -> JSONResponse:
             if slot["state"] != "open":
                 raise HTTPException(status_code=409, detail=f"slot {req_slot} is {slot['state']} (taken or not ready)")
         else:
-            sorted_kinds = sorted(allowed_kinds)
+            if req_kind:
+                if req_kind not in allowed_kinds:
+                    raise HTTPException(status_code=403, detail=f"contributor tier does not permit '{req_kind}'")
+                sorted_kinds = [req_kind]
+            else:
+                sorted_kinds = sorted(allowed_kinds)
             if capabilities:
                 kind_caps = [c for c in capabilities if str(c).startswith("drafter-")]
                 if kind_caps:
@@ -1396,6 +1458,39 @@ async def create_claim(request: Request) -> JSONResponse:
             {"runner": runner_commit, "host_tag": host_tag},
         )
         return JSONResponse(status_code=201, content=_format_claim_response(updated, job_row, base_url=_base_url_for_request(request)))
+
+
+@app.delete("/api/claims")
+def release_all_claims(request: Request, kind: str | None = None) -> dict[str, Any]:
+    """Campfire-compatible release-all endpoint (optionally scoped by ?kind=)."""
+    _require_x_quant(request)
+    with db.tx(immediate=True) as conn:
+        user = _require_auth(conn, request, touch_last_seen=True)
+        if kind:
+            rows = conn.execute(
+                """SELECT s.job, s.slot_id
+                   FROM slots s JOIN jobs j ON s.job = j.job
+                   WHERE s.state='claimed' AND s.claimed_by=? AND j.job_kind=?""",
+                (user["login"], kind),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT job, slot_id FROM slots WHERE state='claimed' AND claimed_by=?",
+                (user["login"],),
+            ).fetchall()
+        released = []
+        for r in rows:
+            conn.execute(
+                """UPDATE slots
+                   SET state='open', claim_id=NULL, claimed_by=NULL, claimed_at=NULL, expires_at=NULL, host_tag=NULL, request_id=NULL
+                   WHERE job=? AND slot_id=? AND state='claimed' AND claimed_by=?""",
+                (r["job"], r["slot_id"], user["login"]),
+            )
+            db.log_audit(conn, user["login"], "claim_released", "ok", r["job"], r["slot_id"], {"bulk": True})
+            released.append({"job": r["job"], "slot_id": r["slot_id"]})
+        if released:
+            db.sweep_expired_uploads(conn)
+        return {"released": len(released), "slots": released}
 
 
 @app.delete("/api/claims/{job}/{slot_id}")
@@ -2367,7 +2462,7 @@ async def admin_upsert_job(request: Request) -> dict[str, Any]:
     body = await request.json()
     job = _validate_id(str(body.get("job") or ""), "job")
     title = str(body.get("title") or job)
-    job_kind = str(body.get("job_kind") or "")
+    job_kind = str(body.get("job_kind") or body.get("kind") or "")
     if job_kind not in config.KIND_TO_TIER:
         raise HTTPException(status_code=400, detail="invalid job_kind")
     model = str(body.get("model") or "GLM-5.3")
