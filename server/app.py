@@ -911,6 +911,30 @@ def list_runners(request: Request, kind: str | None = None) -> list[dict[str, An
         return [dict(r) for r in rows]
 
 
+@app.get("/api/drafter-progress")
+def drafter_progress(request: Request) -> dict[str, Any]:
+    """Public drafter roadmap: step names, states and percentages only (no speed numbers, no drafter names).
+    Written by the owner's progress job to DATA_DIR/drafter-progress.json."""
+    _require_x_quant(request)
+    hide = re.compile(r"v5-s2-w5|s500|sparseloco|codebridge|dflash2|dspine|\bv\d+(?:-[a-z0-9-]+)?\b(?!\.)", re.IGNORECASE)
+
+    def clean(x: Any, n: int) -> str:
+        return re.sub(r"\s{2,}", " ", hide.sub("drafter", str(x)))[:n].strip()
+
+    p = config.DATA_DIR / "drafter-progress.json"
+    try:
+        d = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {"available": False}
+    steps = [
+        {"section": clean(s.get("section", ""), 60), "label": clean(s.get("label", ""), 120),
+         "state": s.get("state") if s.get("state") in ("done", "running", "todo") else "todo"}
+        for s in d.get("steps", [])[:40]
+    ]
+    return {"available": True, "updated": str(d.get("updated", ""))[:40], "overall_pct": float(d.get("overall_pct", 0)),
+            "done": sum(s["state"] == "done" for s in steps), "total": len(steps), "steps": steps}
+
+
 @app.get("/api/jobs")
 def list_jobs(request: Request, kind: str | None = None) -> list[dict[str, Any]]:
     _require_x_quant(request)

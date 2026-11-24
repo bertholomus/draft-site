@@ -183,3 +183,25 @@ def test_campfire_closed_state_kind_claims_and_release_all(site_env: dict[str, A
     g = client.get("/api/grid?job=lbl-c", headers=pub).json()
     assert g["kind"] == "drafter-label"
     assert g["weights"]["id"] is None
+
+
+def test_drafter_progress_public_feed(site_env):
+    """Drafter progress panel: hidden without a feed; with one, only step names/states/percent, and no unreleased
+    drafter names or versions even if the feed carries them (gr8 release versions stay)."""
+    import json as _json
+    import re as _re
+    from server import config
+
+    client = site_env["client"]
+    pub = {**site_env["origin_hdr"], "X-Quant": "1"}
+    assert client.get("/api/drafter-progress", headers=pub).json() == {"available": False}
+    (config.DATA_DIR / "drafter-progress.json").write_text(_json.dumps({
+        "updated": "Nov 23, 10:22 PM PT", "overall_pct": 71.4,
+        "steps": [{"section": "Round 2", "label": "DSpine engine on DFlash2 with v5-s2-w5 s500 and v19", "state": "done"},
+                  {"section": "gr8 v1.2.0", "label": "Exactness passed on v1.2.0", "state": "bogus"}]}))
+    d = client.get("/api/drafter-progress", headers=pub).json()
+    assert d["available"] and d["overall_pct"] == 71.4 and d["done"] == 1 and d["total"] == 2
+    assert d["steps"][1] == {"section": "gr8 v1.2.0", "label": "Exactness passed on v1.2.0", "state": "todo"}
+    body = _json.dumps(d)
+    assert not _re.search(r"v5-s2-w5|s500|dflash2|dspine|\bv19\b", body, _re.IGNORECASE), body
+    assert client.get("/api/drafter-progress", headers=site_env["origin_hdr"]).status_code == 400

@@ -252,6 +252,14 @@ def render_index_html(*, initial_job: str | None = None) -> str:
 
   <!-- TAB 1: PROJECTS & SLOT GRID -->
   <div id="tab-board">
+    <section class="panel" id="drafterProgressPanel" style="display:none">
+      <div class="head">
+        <h3>Drafter Progress</h3>
+        <div class="meta" id="drafterProgressMeta"></div>
+      </div>
+      <div class="body" id="drafterProgressBody"></div>
+    </section>
+
     <section class="panel">
       <div class="head">
         <h3>Active Projects</h3>

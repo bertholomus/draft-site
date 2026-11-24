@@ -423,9 +423,30 @@ async function renderContribsAndAudit() {
     }).join('') + '</tbody></table>';
 }
 
+async function renderDrafterProgress() {
+  const panel = document.getElementById('drafterProgressPanel');
+  if (!panel) return;
+  let d;
+  try { d = await apiGet('/api/drafter-progress'); } catch (e) { return; }
+  if (!d || !d.available) { panel.style.display = 'none'; return; }
+  const pct = Math.max(0, Math.min(100, Number(d.overall_pct) || 0));
+  const icon = { done: '✅', running: '🔄', todo: '⬜' };
+  let html = `<div class="bar" style="height:14px"><span style="width:${pct.toFixed(1)}%;background:var(--verified)"></span></div>
+    <div class="stats-row"><span><strong>${pct.toFixed(0)}%</strong> overall</span><span>${d.done}/${d.total} steps done</span></div>`;
+  let sec = null;
+  for (const s of d.steps) {
+    if (s.section !== sec) { sec = s.section; html += `<div style="margin-top:10px;font:600 11px var(--font-mono);text-transform:uppercase;color:var(--accent-text)">${esc(sec)}</div>`; }
+    html += `<div>${icon[s.state] || '⬜'} ${esc(s.label)}</div>`;
+  }
+  document.getElementById('drafterProgressBody').innerHTML = html;
+  document.getElementById('drafterProgressMeta').textContent = d.updated ? 'Updated ' + d.updated : '';
+  panel.style.display = '';
+}
+
 async function refreshAll() {
   await refreshSession();
   if (document.body.dataset.page === 'admin') return;
+  renderDrafterProgress();
   try {
     JOBS = await apiGet('/api/jobs');
     const initJob = document.body.dataset.initialJob;
