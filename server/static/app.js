@@ -374,34 +374,86 @@ async function selectJob(jobId) {
   document.getElementById('gridMeta').textContent =
     `${kind} · ${weightsHf}@${weightsRev} · ${data.total_slots} slots`;
   const sg = document.getElementById('slotGrid');
-  const activeSlots = data.slots.filter(s => s.state !== 'open');
-  const openSlots = data.slots.filter(s => s.state === 'open');
-  const maxOpenShow = 48;
-  const shown = data.slots.length > 80 ? activeSlots.concat(openSlots.slice(0, maxOpenShow)) : data.slots;
-  const hiddenOpen = Math.max(0, (data.slots.length > 80 ? openSlots.length - maxOpenShow : 0)) +
-    Math.max(0, data.total_slots - data.slots.length);
-  sg.innerHTML = shown.map(s => {
-    const m = s.metrics || {};
-    let mline = '';
-    if (m.owner_gate && m.owner_gate.top1_agree != null) {
-      mline = `gate top1=${(100 * m.owner_gate.top1_agree).toFixed(1)}% top5=${(100 * m.owner_gate.top5_agree).toFixed(1)}%`;
-    } else if (m.n_rows != null) {
-      mline = `${m.n_rows} rows · ${m.total_gen_tokens || m.n_tokens || 0} tok`;
-    } else if (s.upload_bytes) {
-      mline = fmtBytes(s.upload_bytes);
-    } else if (s.depends_on && s.state === 'not_ready') {
-      mline = `awaits ${s.depends_on}`;
-    }
-    const dispLogin = s.display_login || s.contributor_login;
-    const by = dispLogin ? `by ${esc(dispLogin)}` : '';
-    return `<div class="slot-cell st-${esc(s.state)}" title="${esc(s.verify_status || s.state)}">
-      <div class="sid">${esc(s.slot_id)}</div>
-      <div class="st">${esc(s.state)} · ${esc(s.profile || s.col)}</div>
-      <div class="meta2">${by}${by && mline ? '<br>' : ''}${esc(mline)}${s.verify_status ? '<br>gate: ' + esc(s.verify_status) : ''}</div>
-    </div>`;
-  }).join('') + (hiddenOpen > 0
-    ? `<div class="slot-cell st-open"><div class="sid">+${hiddenOpen} more slots</div><div class="st">queued</div><div class="meta2">ready for contributors</div></div>`
-    : '');
+  GRID_SLOTS = new Map(data.slots.map(s => [s.slot_id, s]));
+  // Campfire-style compact board: one row per job row (batch, checkpoint, ...), one small tile per slot.
+  const axisRows = (data.axes && Array.isArray(data.axes.rows)) ? data.axes.rows.slice() : [];
+  const byRow = new Map(axisRows.map(r => [r, []]));
+  for (const s of data.slots) {
+    const r = s.row || '';
+    if (!byRow.has(r)) byRow.set(r, []);
+    byRow.get(r).push(s);
+  }
+  const hidden = Math.max(0, (data.total_slots || 0) - data.slots.length);
+  sg.innerHTML = [...byRow.entries()].filter(([, list]) => list.length).map(([r, list]) => {
+    const tiles = list.map(s => {
+      const cls = `slot-cell st-${esc(s.state)}${s.mine ? ' mine' : ''}`;
+      return `<i class="${cls}" data-slot="${esc(s.slot_id)}"></i>`;
+    }).join('');
+    return `<div class="slot-row"><span class="rlabel" title="${esc(r)}">${esc(r || '—')}</span><div class="tiles">${tiles}</div></div>`;
+  }).join('') + (hidden > 0 ? `<div class="slot-more">+${hidden} more slots not shown</div>` : '');
+  const selBox = document.getElementById('slotSel');
+  if (selBox) selBox.innerHTML = '<span class="muted">Hover a tile for its slot; click it for details.</span>';
+}
+
+let GRID_SLOTS = new Map();
+
+function slotLines(s) {
+  const m = s.metrics || {};
+  let mline = '';
+  if (m.owner_gate && m.owner_gate.top1_agree != null) {
+    mline = `gate top1=${(100 * m.owner_gate.top1_agree).toFixed(1)}% top5=${(100 * m.owner_gate.top5_agree).toFixed(1)}%`;
+  } else if (m.n_rows != null) {
+    mline = `${m.n_rows} rows · ${m.total_gen_tokens || m.n_tokens || 0} tok`;
+  } else if (s.upload_bytes) {
+    mline = fmtBytes(s.upload_bytes);
+  } else if (s.depends_on && s.state === 'not_ready') {
+    mline = `awaits ${s.depends_on}`;
+  }
+  const who = s.display_login || s.contributor_login;
+  return {
+    head: `${s.slot_id} · ${s.state} · ${s.profile || s.col}`,
+    who: who ? `by ${who}` : '',
+    mline,
+    gate: s.verify_status ? `gate: ${s.verify_status}` : '',
+  };
+}
+
+function slotTipText(s) {
+  const L = slotLines(s);
+  return [L.head, L.who, L.mline].filter(Boolean).join(' · ');
+}
+
+function showSlotDetail(s) {
+  const box = document.getElementById('slotSel');
+  if (!box) return;
+  const L = slotLines(s);
+  box.innerHTML = `<strong>${esc(L.head)}</strong>` +
+    `<span class="muted">${esc(s.row || '')}${s.col ? ' / ' + esc(s.col) : ''}</span>` +
+    [L.who, L.mline, L.gate].filter(Boolean).map(x => `<span>${esc(x)}</span>`).join('');
+}
+
+function wireSlotGrid() {
+  const sg = document.getElementById('slotGrid');
+  const tip = document.getElementById('slotTip');
+  if (!sg || !tip) return;
+  sg.addEventListener('mousemove', ev => {
+    const t = ev.target.closest('.slot-cell');
+    const s = t && GRID_SLOTS.get(t.dataset.slot);
+    if (!s) { tip.style.display = 'none'; return; }
+    tip.textContent = slotTipText(s);
+    tip.style.display = 'block';
+    tip.style.left = (ev.clientX + 12) + 'px';
+    tip.style.top = (ev.clientY + 12) + 'px';
+  });
+  sg.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
+  sg.addEventListener('click', ev => {
+    const t = ev.target.closest('.slot-cell');
+    const s = t && GRID_SLOTS.get(t.dataset.slot);
+    if (!s) return;
+    sg.querySelectorAll('.slot-cell.sel').forEach(x => x.classList.remove('sel'));
+    t.classList.add('sel');
+    showSlotDetail(s);
+  });
 }
 
 async function renderContribsAndAudit() {
@@ -495,6 +547,8 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     });
   }
+
+  wireSlotGrid();
 
   const createKeyBtn = document.getElementById('createKeyBtn');
   if (createKeyBtn) {

@@ -135,22 +135,26 @@ header.top {
 .stats-row { display: flex; gap: 10px; flex-wrap: wrap; font: 12px var(--font-mono); color: var(--muted); }
 .legend { display: flex; gap: 12px; flex-wrap: wrap; font: 12px var(--font-mono); color: var(--muted); margin-bottom: 14px; }
 .sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: middle; }
-.slot-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(175px, 1fr)); gap: 10px; }
-.slot-cell {
-  border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: var(--surface-2);
-  font: 12px var(--font-mono); position: relative;
-}
-.slot-cell.st-verified { border-left: 4px solid var(--verified); }
-.slot-cell.st-uploaded { border-left: 4px solid var(--uploaded); }
-.slot-cell.st-claimed { border-left: 4px solid var(--claimed); }
-.slot-cell.st-open { border-left: 4px solid var(--open); }
-.slot-cell.st-closed { border-left: 4px solid var(--closed); opacity: 0.85; }
-.slot-cell.st-not_ready { border-left: 4px solid var(--notready); opacity: 0.72; }
-.slot-cell.st-disabled { border-left: 4px solid var(--disabled); opacity: 0.65; }
-.slot-cell.st-rejected { border-left: 4px solid var(--rejected); }
-.slot-cell .sid { font-weight: 600; color: var(--fg); word-break: break-all; }
-.slot-cell .st { text-transform: uppercase; font-size: 11px; margin-top: 3px; }
-.slot-cell .meta2 { color: var(--muted); font-size: 11px; margin-top: 4px; line-height: 1.4; }
+.slot-grid { display: flex; flex-direction: column; gap: 3px; overflow-x: auto; }
+.slot-row { display: flex; align-items: center; gap: 8px; }
+.slot-row .rlabel { flex: 0 0 15ch; font: 11px var(--font-mono); color: var(--muted); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.slot-row .tiles { display: flex; flex-wrap: wrap; gap: 2px; }
+.slot-cell { display: block; width: 13px; height: 13px; border-radius: 2px; background: var(--notready); cursor: pointer; }
+.slot-cell.st-verified { background: var(--verified); }
+.slot-cell.st-uploaded { background: var(--uploaded); }
+.slot-cell.st-claimed { background: var(--claimed); }
+.slot-cell.st-open { background: var(--open); }
+.slot-cell.st-closed { background: var(--closed); }
+.slot-cell.st-not_ready { background: var(--notready); outline: 1px solid var(--line); outline-offset: -1px; }
+.slot-cell.st-disabled { background: var(--disabled); }
+.slot-cell.st-rejected { background: var(--rejected); }
+.slot-cell.mine { box-shadow: inset 0 0 0 1.5px var(--mine); }
+.slot-cell:hover, .slot-cell.sel { outline: 2px solid var(--fg); outline-offset: 0; }
+.slot-more { font: 11px var(--font-mono); color: var(--muted); margin-top: 6px; }
+#slotSel { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: baseline; margin-top: 12px; font: 12px var(--font-mono); min-height: 18px; }
+#slotSel .muted { color: var(--muted); }
+#slotTip { position: fixed; pointer-events: none; display: none; white-space: nowrap; z-index: 40; padding: 4px 9px; border-radius: 6px;
+  background: var(--surface); border: 1px solid var(--line); box-shadow: var(--lift); font: 12px var(--font-mono); color: var(--fg); }
 table { width: 100%; border-collapse: collapse; font: 13px var(--font-mono); }
 th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
 th { color: var(--muted); font-weight: 500; font-size: 12px; }
@@ -287,6 +291,8 @@ def render_index_html(*, initial_job: str | None = None) -> str:
           <span><i class="sw" style="background:var(--rejected)"></i>rejected</span>
         </div>
         <div class="slot-grid" id="slotGrid"></div>
+        <div id="slotSel"></div>
+        <div id="slotTip"></div>
       </div>
     </section>
   </div>
